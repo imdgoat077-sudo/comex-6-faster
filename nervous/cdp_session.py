@@ -146,6 +146,9 @@ class TabSessionContext:
         self._pump_task: Optional[asyncio.Task] = None
         self._running: bool = False
 
+        # Geometry of the latest screenshot taken in this tab: coordinates are only valid against it
+        self.last_viewport: Optional[Any] = None
+
         # Auto-answered JavaScript dialogs (see _auto_answer_dialog)
         self.last_dialog: Optional[Dict[str, Any]] = None
         self._dialog_tasks: set = set()

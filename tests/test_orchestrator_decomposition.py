@@ -110,7 +110,7 @@ async def test_decomposition_reads_work_packages_and_drops_overlap():
     assert surveys.description.startswith("Find survey papers")
     assert surveys.metadata["package"] == {"sources": "arXiv, Semantic Scholar",
                                            "method": ["Search arXiv", "Extract results"],
-                                           "collect": "title, year, link"}
+                                           "collect": "title, year, link", "read_urls": []}
     assert surveys.url == "https://arxiv.org/search/?query=survey"
     assert plan.tasks[1].metadata["package"]["method"] == ["Search Semantic Scholar for benchmarks"]
 

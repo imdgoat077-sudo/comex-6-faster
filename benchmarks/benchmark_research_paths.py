@@ -30,7 +30,8 @@ import httpx
 import websockets
 
 ROOT = Path(__file__).resolve().parent.parent
-BACKEND = "http://127.0.0.1:8000"
+MODES = ["single", "multi"]
+BACKEND = "http://127.0.0.1:8000"   # --backend / --cdp point a run at an isolated stack instead
 CDP = "http://127.0.0.1:9222"
 REQUEST = "Find me the best research papers on multi agent orchestration."
 
@@ -70,6 +71,11 @@ async def _stream(client: httpx.AsyncClient, url: str, body: dict, headers: dict
     return events, round(time.monotonic() - t0, 2)
 
 
+def _answer_time(events: list) -> float | None:
+    """When the answer reached the user: first completed/done event (stream close can be later)."""
+    return next((t for t, e, _ in events if e in ("completed", "done")), None)
+
+
 def _quality(answer: str) -> dict:
     links = []
     for m in LINK_RX.finditer(answer or ""):
@@ -82,7 +88,12 @@ def _quality(answer: str) -> dict:
             m = rx.search(url)
             if m:
                 papers.setdefault(f"{kind}:{m.group(1).lower()}", url)
-    return {"links": links, "paper_ids": sorted(papers), "paper_links": list(papers.values())}
+    paper_urls = set(papers.values())
+    rows = [ln for ln in (answer or "").splitlines() if any(u in ln for u in paper_urls)]
+    year_rx = re.compile(r"\b(19|20)\d{2}\b")
+    with_year = sum(1 for ln in rows if year_rx.search(ln))
+    return {"links": links, "paper_ids": sorted(papers), "paper_links": list(papers.values()),
+            "rows_with_paper_link": len(rows), "rows_with_year": with_year}
 
 
 async def _check_links(urls: list) -> dict:
@@ -173,7 +184,8 @@ async def run(phase: str, trials: int) -> None:
     token = _internal_token()
     order = []
     for i in range(trials):
-        order += (["single", "multi"] if i % 2 == 0 else ["multi", "single"])
+        modes = [m for m in (["single", "multi"] if i % 2 == 0 else ["multi", "single"]) if m in MODES]
+        order += modes
     async with httpx.AsyncClient() as client:
         for n, mode in enumerate(order, 1):
             closed = await _close_finished_agent_tabs()
@@ -185,6 +197,7 @@ async def run(phase: str, trials: int) -> None:
             else:
                 events, wall = await _stream(client, f"{BACKEND}/agent/orchestrate/stream", {"user_request": REQUEST}, {})
                 rec = _summarise_multi(events, wall)
+            rec["answer_s"] = _answer_time(events)
             q = _quality(rec["answer"])
             rec["quality"] = {**q, "paper_count": len(q["paper_ids"]), "link_status": await _check_links(q["paper_links"])}
             rec.update({"mode": mode, "trial": n, "phase": phase, "request": REQUEST,
@@ -224,7 +237,12 @@ async def run(phase: str, trials: int) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=["before", "after"])
+    ap.add_argument("--phase", required=True, help="label for the output folder under benchmarks/research_paths/")
     ap.add_argument("--trials", type=int, default=5)
+    ap.add_argument("--backend", default=BACKEND)
+    ap.add_argument("--cdp", default=CDP)
+    ap.add_argument("--modes", default="single,multi")
     a = ap.parse_args()
+    BACKEND, CDP = a.backend, a.cdp
+    MODES = a.modes.split(",")
     asyncio.run(run(a.phase, a.trials))

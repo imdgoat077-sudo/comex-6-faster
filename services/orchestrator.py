@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import os
+import statistics
 import logging
 import re
 import secrets
@@ -205,6 +207,10 @@ def validate_dependency_graph(tasks: Dict[str, OrchestratorTask]) -> None:
             _dfs(tid, [])
 
 
+STRAGGLER_GRACE_FACTOR = float(os.getenv("COMEX_STRAGGLER_GRACE_FACTOR", "0.4"))
+STRAGGLER_MIN_GRACE_S = float(os.getenv("COMEX_STRAGGLER_MIN_GRACE_S", "8"))
+
+
 def _safe_id(raw: str) -> str:
     """Restrict ids to characters valid in tab ids / CDP cursor payloads."""
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", (raw or "").strip())[:48]
@@ -247,15 +253,55 @@ Respond with ONLY a JSON object (no prose, no markdown fences):
 {{"subtasks": [{{
     "id": "short_snake_case_id",
     "objective": "the exact question this agent answers and its scope (one or two sentences)",
-    "sources": "where to search, most useful first, e.g. 'arXiv listing search, Semantic Scholar'",
-    "method": ["concrete step 1", "concrete step 2", "concrete step 3"],
-    "collect": "the fields to record for every result, e.g. 'title, authors, year, venue, link, one-line contribution'",
-    "url": "best starting URL (a search URL if possible) or null"
+    "read_urls": ["1 to 3 complete URLs, most useful first"],
+    "collect": "the fields to record for every result, e.g. 'title, authors, year, venue, link, one-line contribution'"
   }}],
   "follow_up_action": "action to perform on the chosen result after comparing, or null"}}
 
+"read_urls": these pages are opened and read FOR the agent before it starts, so give search-result or listing pages
+that already contain the answer for this package's facet, on authoritative sites, with the query written into the URL
+(URL-encoded), e.g. https://arxiv.org/search/?query=multi-agent+orchestration+survey&searchtype=all or
+https://www.google.com/search?q=best+noise+cancelling+headphones+under+10000+india. Never a site's home page.
+Different packages must not read the same page.
+Pick pages that load quickly. Measured: search-engine result pages (Google or DuckDuckGo, using the site: operator to
+reach a specific site, e.g. site:arxiv.org), Google Scholar, https://api.openalex.org/works?search=<query> (scholarly
+works with year, venue and citation counts) and Wikipedia answer within a few seconds, while some sites' own search pages
+(arXiv search, Semantic Scholar) are often slow or rate-limited. A page that does not answer within about 8 seconds is
+skipped.
+
 "follow_up_action": only if the user also wants something DONE with the best/chosen result (e.g. "add the
 best one to the cart", "open the cheapest flight"); otherwise null."""
+
+
+MAX_READ_URLS = 3
+# Browser actions a worker may add after its pages were read for it (extra navigations cost ~6 s of model time each)
+PREFETCH_FOLLOWUP_ACTIONS = int(os.getenv("COMEX_PREFETCH_FOLLOWUP_ACTIONS", "3"))
+
+
+def _clean_read_urls(raw: Any, seen: Set[str]) -> List[str]:
+    """Keep at most MAX_READ_URLS valid http(s) URLs that no other package already reads."""
+    from nervous.action_policy import validate_navigation_url
+    if isinstance(raw, str):
+        raw = [raw]
+    out: List[str] = []
+    for u in raw if isinstance(raw, list) else []:
+        if not isinstance(u, str):
+            continue
+        u = u.strip()
+        if not u or u.lower() == "null" or len(u) > 1500:
+            continue
+        try:
+            u = validate_navigation_url(u)
+        except Exception:
+            continue  # unsafe or malformed: the worker simply starts without this page
+        key = u.split("#")[0].rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+        if len(out) >= MAX_READ_URLS:
+            break
+    return out
 
 
 def _parse_decomposition_response(raw_text: str, max_tasks: int) -> Optional[RunPlan]:
@@ -286,6 +332,7 @@ def _parse_decomposition_response(raw_text: str, max_tasks: int) -> Optional[Run
     tasks: List[OrchestratorTask] = []
     seen_ids: Set[str] = set()
     seen_objectives: Set[str] = set()
+    seen_urls: Set[str] = set()
     for item in parsed:
         if len(tasks) >= max_tasks:
             break
@@ -309,7 +356,10 @@ def _parse_decomposition_response(raw_text: str, max_tasks: int) -> Optional[Run
             "method": [_clip(m, 300) for m in (method or []) if _clip(m, 300)][:5],
             "collect": _clip(item.get("collect"), 300),
         }
+        read_urls = _clean_read_urls(item.get("read_urls"), seen_urls)
+        package["read_urls"] = read_urls
         url = item.get("url")
+        start_url = str(url).strip() if url and str(url).strip().lower() != "null" else None
         tasks.append(
             OrchestratorTask(
                 id=tid,
@@ -317,7 +367,8 @@ def _parse_decomposition_response(raw_text: str, max_tasks: int) -> Optional[Run
                 dependencies=[],
                 deadline_seconds=90.0,
                 requires_browser=True,
-                url=str(url).strip() if url and str(url).strip().lower() != "null" else None,
+                # the worker's tab opens on its first page to read, so nothing is navigated twice
+                url=read_urls[0] if read_urls else start_url,
                 metadata={"package": package},
             )
         )
@@ -385,15 +436,28 @@ def build_worker_brief(user_request: str, task: OrchestratorTask, all_tasks: Lis
         "",
         f"YOUR OBJECTIVE: {task.description}",
     ]
+    read_urls = package.get("read_urls") or []
     if package.get("sources"):
         lines.append(f"WHERE TO SEARCH: {package['sources']}")
-    if task.url:
+    if read_urls:
+        lines.append("PAGES ALREADY READ FOR YOU (their content is in the data block after this brief):")
+        lines.extend(f"- {u}" for u in read_urls)
+    elif task.url:
         lines.append(f"Your tab is already open at {task.url}; start there.")
-    steps = package.get("method") or [
-        "Run a search that targets your objective directly (use the site's search URL).",
-        "Read the whole result list with one browser_extract.",
-        "Refine with one more search only if the first results are thin or off-target.",
-    ]
+    if read_urls:
+        steps = [
+            "Read the pages in the data block carefully. They are real search or listing pages for your objective.",
+            "If they already contain strong results for your objective, write your final answer NOW without further browsing.",
+            "Otherwise make as few extra browser calls as possible (you have at most "
+            f"{PREFETCH_FOLLOWUP_ACTIONS}): one browser_sequence that navigates to the missing page(s) "
+            "and extracts each (several pages per call), or open an individual page only for a fact that is missing from the lists.",
+        ] + [f"Only if something is still missing: {m}" for m in (package.get("method") or [])[:2]]
+    else:
+        steps = package.get("method") or [
+            "Run a search that targets your objective directly (use the site's search URL).",
+            "Read the whole result list with one browser_extract.",
+            "Refine with one more search only if the first results are thin or off-target.",
+        ]
     lines.append("STEPS:")
     lines.extend(f"{i}. {step}" for i, step in enumerate(steps, 1))
     lines.append(f"COLLECT FOR EVERY RESULT: {package.get('collect') or 'name/title, link, and the key facts that answer your objective'}")
@@ -408,7 +472,8 @@ def build_worker_brief(user_request: str, task: OrchestratorTask, all_tasks: Lis
         "HOW TO WORK:",
         "- Prefer authoritative sources (official sites, publishers, peer-reviewed venues, arXiv) over blogs and aggregators.",
         "- Read result lists, not item pages: one browser_extract on a results page returns every item and its link. "
-        "Open an individual page only when a fact you must collect is missing from the list.",
+        "Open an individual page only when a fact you must collect is missing from the list. Combine several pages "
+        "into ONE browser_sequence call (navigate, extract, navigate, extract) instead of one call per page.",
         "- Only report facts you saw on a page; never fill gaps from memory. Mark anything unverified as such.",
         "- You have a limited number of browser actions and a time limit. Stop as soon as you have strong results "
         "for your objective; quality and relevance matter more than count.",
@@ -626,6 +691,35 @@ class MultiAgentOrchestrator:
         task_completion_events: Dict[str, asyncio.Event] = {
             tid: asyncio.Event() for tid in run.tasks
         }
+        soft_stops: Dict[str, asyncio.Event] = {tid: asyncio.Event() for tid in run.tasks}
+
+        async def _straggler_policy() -> None:
+            """
+            The run waits for its slowest worker, so once all but one have finished the last one gets a bounded grace
+            period (a share of how long the others took) and is then asked to wrap up with what it has. Partial findings
+            are kept and marked as such by the worker; a deliberate trade of a little depth for a lot of waiting.
+            """
+            if len(run.tasks) < 2:
+                return
+            while True:
+                await asyncio.sleep(0.25)
+                done = [t for t in run.tasks.values() if task_completion_events[t.id].is_set()]
+                pending = [t for t in run.tasks.values() if not task_completion_events[t.id].is_set()]
+                if not pending:
+                    return
+                if len(pending) == 1 and len(done) >= 1:
+                    durations = [(t.end_time_mono - t.start_time_mono) for t in done if t.end_time_mono and t.start_time_mono]
+                    if not durations:
+                        continue
+                    grace = max(STRAGGLER_MIN_GRACE_S, STRAGGLER_GRACE_FACTOR * statistics.median(durations))
+                    last_done = max(t.end_time_mono for t in done if t.end_time_mono)
+                    wait = last_done + grace - time.monotonic()
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    if not task_completion_events[pending[0].id].is_set():
+                        logger.info("Straggler policy: asking '%s' to wrap up after %.1fs grace", pending[0].id, grace)
+                        soft_stops[pending[0].id].set()
+                    return
 
         async def _worker_wrapper(task: OrchestratorTask):
             # 1. Wait for all prerequisites
@@ -706,7 +800,12 @@ class MultiAgentOrchestrator:
                         lease_registry=self.lease_registry,
                         trusted_server_context=not task.requires_browser,
                         # Workers report their current step ("Opening amazon.in") through this callback
-                        metadata={"report_progress": lambda label, _t=task: _emit("task_progress", _t, {"label": label})},
+                        metadata={
+                            "report_progress": lambda label, _t=task: _emit("task_progress", _t, {"label": label}),
+                            "prefetch_urls": ((task.metadata or {}).get("package") or {}).get("read_urls") or None,
+                            "start_url": task.url,
+                            "soft_stop": soft_stops[task.id],
+                        },
                     )
 
                     # 5. Execute task routine
@@ -798,7 +897,11 @@ class MultiAgentOrchestrator:
 
         # Execute all tasks concurrently (semaphore enforces max_concurrency)
         worker_coros = [_worker_wrapper(t) for t in run.tasks.values()]
-        await asyncio.gather(*worker_coros, return_exceptions=True)
+        watcher = asyncio.create_task(_straggler_policy())
+        try:
+            await asyncio.gather(*worker_coros, return_exceptions=True)
+        finally:
+            watcher.cancel()
 
         t_elapsed_ms = round((time.monotonic() - t_start) * 1000.0, 2)
         run.completed_at_mono = time.monotonic()

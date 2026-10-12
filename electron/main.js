@@ -65,7 +65,10 @@ function isSafeNavigationUrl(rawUrl) {
 }
 
 // Enable Chrome DevTools Protocol so Playwright can attach to this browser.
-app.commandLine.appendSwitch('remote-debugging-port', '9222');
+// COMEX_CDP_PORT / COMEX_USER_DATA let a second, isolated instance run beside the normal app (benchmarks and tests).
+// Unset, behaviour is unchanged: port 9222 and the default profile.
+app.commandLine.appendSwitch('remote-debugging-port', process.env.COMEX_CDP_PORT || '9222');
+if (process.env.COMEX_USER_DATA) app.setPath('userData', process.env.COMEX_USER_DATA);
 
 let mainWindow;
 const isVisualCursorEnabled = process.env.VISUAL_CURSOR_ENABLED !== 'false';
@@ -355,6 +358,8 @@ function createWindow() {
     minHeight: 600,
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 16 },
+    // Benchmark instances open without taking keyboard focus from whatever the user is doing
+    ...(process.env.COMEX_BENCH_WINDOW === '1' ? { show: false, focusable: false } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -363,6 +368,8 @@ function createWindow() {
       allowRunningInsecureContent: false,
     },
   });
+
+  if (process.env.COMEX_BENCH_WINDOW === '1') mainWindow.once('ready-to-show', () => mainWindow.showInactive());
 
   // The React shell (localhost:5173) should never try to open a new browser window.
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

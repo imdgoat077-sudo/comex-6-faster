@@ -46,6 +46,26 @@ from nervous.cdp_session import (
     extract_canonical_target_id,
     get_or_create_tab_session,
 )
+from nervous.page_io import (
+    MAX_EVAL_CHARS,
+    PageIOError,
+    capture_screenshot,
+    describe_point,
+    evaluate_readonly,
+    measure_viewport,
+    plan_keys,
+    pointer_action,
+    press_keys as pio_press_keys,
+    read_table as pio_read_table,
+    scroll_into_view as pio_scroll_into_view,
+    scroll_wheel as pio_scroll_wheel,
+    select_option as pio_select_option,
+    wait_for as pio_wait_for,
+    _FINGERPRINT_JS,
+)
+from nervous.page_strategy import _PERCEPTION_JS, choose_strategy, describe_grid
+from nervous.viewport import drift_reason, in_viewport, screenshot_to_viewport
+from services.tab_provisioning import is_trusted_ui_target_url
 
 try:
     from graph.store import AgentGraphStore
@@ -159,6 +179,15 @@ DEFAULT_PERMITTED_OPERATIONS: frozenset[str] = frozenset({
     "type",
     "extract",
     "perform_sequence",
+    "observe",
+    "screenshot",
+    "evaluate",
+    "read_table",
+    "wait_for",
+    "press_keys",
+    "scroll",
+    "pointer",
+    "select_option",
     "get_context",
     "search_memory",
     "save_artifact",
@@ -195,19 +224,40 @@ MAX_CONDITION_TEXT_LEN: int = 1_000
 MAX_CONDITIONS_PER_STEP: int = 5
 MAX_TOTAL_CONDITIONS_PER_SEQUENCE: int = 20
 
+# Input and observation steps added for games, canvases, drawing apps and tables (see nervous/page_io.py)
+INPUT_SEQUENCE_ACTIONS: frozenset[str] = frozenset({
+    "keys", "scroll", "click_at", "double_click_at", "right_click_at", "move_to", "drag", "select",
+})
+OBSERVE_SEQUENCE_ACTIONS: frozenset[str] = frozenset({"wait", "evaluate"})
+NEW_SEQUENCE_ACTIONS: frozenset[str] = INPUT_SEQUENCE_ACTIONS | OBSERVE_SEQUENCE_ACTIONS
+
+# The operation name a step is authorized under (contexts list permitted operations by these names)
+STEP_OPERATION: Dict[str, str] = {
+    "keys": "press_keys", "scroll": "scroll", "click_at": "pointer", "double_click_at": "pointer",
+    "right_click_at": "pointer", "move_to": "pointer", "drag": "pointer", "select": "select_option",
+    "wait": "wait_for", "evaluate": "evaluate",
+}
+
+
+def _operation_for_step(action: str) -> str:
+    return STEP_OPERATION.get(action, action)
+
+
 ALLOWED_SEQUENCE_ACTIONS: frozenset[str] = frozenset({
     "click",
     "type",
     "navigate",
     "inspect",
     "extract",
-})
+}) | NEW_SEQUENCE_ACTIONS
 
 MUTATING_SEQUENCE_ACTIONS: frozenset[str] = frozenset({
     "click",
     "type",
     "navigate",
-})
+}) | INPUT_SEQUENCE_ACTIONS
+
+SEQUENCE_POSTCONDITION_SETTLE_S: float = 2.0   # new steps poll their postconditions this long before failing
 
 ALLOWED_CONDITION_TYPES: frozenset[str] = frozenset({
     "url_contains",
@@ -218,6 +268,9 @@ ALLOWED_CONDITION_TYPES: frozenset[str] = frozenset({
     "element_visible",
     "text_contains",
     "value_matches",
+    "js_true",          # expected = a read-only JavaScript expression that must be truthy
+    "text_absent",      # expected = text that must NOT be visible
+    "element_hidden",   # selector must be missing or not displayed
 })
 
 ALLOWED_STEP_KEYS: frozenset[str] = frozenset({
@@ -230,6 +283,18 @@ ALLOWED_STEP_KEYS: frozenset[str] = frozenset({
     "url",
     "max_elements",
     "max_chars",
+    "keys",
+    "x",
+    "y",
+    "to_x",
+    "to_y",
+    "value",
+    "delta_x",
+    "delta_y",
+    "to",
+    "condition",
+    "timeout_ms",
+    "expression",
     "preconditions",
     "postconditions",
 })
@@ -240,6 +305,16 @@ ACTION_ALLOWED_KEYS: Dict[str, frozenset[str]] = {
     "navigate": frozenset({"action", "url", "preconditions", "postconditions"}),
     "inspect": frozenset({"action", "max_elements", "preconditions", "postconditions"}),
     "extract": frozenset({"action", "selector", "max_chars", "preconditions", "postconditions"}),
+    "keys": frozenset({"action", "keys", "text", "preconditions", "postconditions"}),
+    "scroll": frozenset({"action", "delta_x", "delta_y", "to", "selector", "x", "y", "preconditions", "postconditions"}),
+    "click_at": frozenset({"action", "x", "y", "preconditions", "postconditions"}),
+    "double_click_at": frozenset({"action", "x", "y", "preconditions", "postconditions"}),
+    "right_click_at": frozenset({"action", "x", "y", "preconditions", "postconditions"}),
+    "move_to": frozenset({"action", "x", "y", "preconditions", "postconditions"}),
+    "drag": frozenset({"action", "x", "y", "to_x", "to_y", "preconditions", "postconditions"}),
+    "select": frozenset({"action", "selector", "value", "preconditions", "postconditions"}),
+    "wait": frozenset({"action", "condition", "timeout_ms", "preconditions", "postconditions"}),
+    "evaluate": frozenset({"action", "expression", "preconditions", "postconditions"}),
 }
 
 ALLOWED_CONDITION_KEYS: frozenset[str] = frozenset({
@@ -277,8 +352,93 @@ class SequenceStep:
     url: Optional[str] = None
     max_elements: int = 50
     max_chars: int = 8000
+    keys: Tuple[str, ...] = field(default_factory=tuple)          # keys: key names and chords
+    x: Optional[float] = None                                      # pointer steps: CSS viewport pixels
+    y: Optional[float] = None
+    to_x: Optional[float] = None
+    to_y: Optional[float] = None
+    value: Optional[str] = None                                    # select: option value or visible text
+    delta_x: float = 0.0                                           # scroll
+    delta_y: float = 0.0
+    scroll_to: Optional[str] = None                                # scroll: "top" | "bottom"
+    wait_condition: Optional[str] = None                           # wait: JSON of the condition (hashable, frozen)
+    timeout_ms: int = 5000
+    expression: Optional[str] = None                               # evaluate: read-only JavaScript
     preconditions: Tuple[SequenceCondition, ...] = field(default_factory=tuple)
     postconditions: Tuple[SequenceCondition, ...] = field(default_factory=tuple)
+
+
+_WAIT_TYPES = frozenset({"idle", "text", "text_gone", "selector", "js", "url_contains"})
+
+
+def _finite_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
+
+
+def _parse_new_step_fields(idx: int, action: str, s: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Validate and normalise the fields of the input and observation step kinds. Returns (fields, error)."""
+    out: Dict[str, Any] = {}
+    if action == "keys":
+        raw_keys = s.get("keys", [])
+        text = s.get("text")
+        if not isinstance(raw_keys, list) or not all(isinstance(k, str) for k in raw_keys):
+            return out, f"Step {idx} ('keys') 'keys' must be a list of strings."
+        if text is not None and not isinstance(text, str):
+            return out, f"Step {idx} ('keys') 'text' must be a string."
+        try:
+            plan_keys(raw_keys, text)
+        except PageIOError as pe:
+            return out, f"Step {idx} ('keys'): {pe}"
+        out["keys"] = tuple(raw_keys)
+    elif action in ("click_at", "double_click_at", "right_click_at", "move_to", "drag"):
+        need = ("x", "y", "to_x", "to_y") if action == "drag" else ("x", "y")
+        for k in need:
+            if not _finite_number(s.get(k)):
+                return out, f"Step {idx} ('{action}') requires a finite number '{k}' (CSS viewport pixels)."
+            out[k] = float(s[k])
+    elif action == "scroll":
+        for k in ("delta_x", "delta_y", "x", "y"):
+            if k in s and not _finite_number(s[k]):
+                return out, f"Step {idx} ('scroll') '{k}' must be a finite number."
+        for k in ("delta_x", "delta_y"):
+            if k in s:
+                if abs(s[k]) > 100000:
+                    return out, f"Step {idx} ('scroll') '{k}' must be within 100000 pixels."
+                out[k] = float(s[k])
+        if "x" in s:
+            out["x"] = float(s["x"])
+        if "y" in s:
+            out["y"] = float(s["y"])
+        to = s.get("to")
+        if to is not None and to not in ("top", "bottom"):
+            return out, f"Step {idx} ('scroll') 'to' must be 'top' or 'bottom'."
+        out["scroll_to"] = to
+        if not (out.get("delta_x") or out.get("delta_y") or to or s.get("selector")):
+            return out, f"Step {idx} ('scroll') needs delta_y/delta_x, 'to', or a selector."
+    elif action == "select":
+        if not s.get("selector"):
+            return out, f"Step {idx} ('select') requires 'selector'."
+        v = s.get("value")
+        if not isinstance(v, str) or not v.strip() or len(v) > 200:
+            return out, f"Step {idx} ('select') requires 'value' (option value or visible text, up to 200 characters)."
+        out["value"] = v.strip()
+    elif action == "wait":
+        cond = s.get("condition")
+        if not isinstance(cond, dict) or cond.get("type") not in _WAIT_TYPES:
+            return out, f"Step {idx} ('wait') 'condition' must be an object with type in {sorted(_WAIT_TYPES)}."
+        if any(not isinstance(v, (str, int, float, bool)) for v in cond.values()) or len(json.dumps(cond)) > 1500:
+            return out, f"Step {idx} ('wait') 'condition' is malformed or too large."
+        t = s.get("timeout_ms", 5000)
+        if not isinstance(t, int) or isinstance(t, bool) or not (100 <= t <= 30000):
+            return out, f"Step {idx} ('wait') 'timeout_ms' must be an integer between 100 and 30000."
+        out["wait_condition"] = json.dumps(cond, sort_keys=True)
+        out["timeout_ms"] = t
+    elif action == "evaluate":
+        e = s.get("expression")
+        if not isinstance(e, str) or not e.strip() or len(e) > MAX_EVAL_CHARS:
+            return out, f"Step {idx} ('evaluate') requires 'expression' (up to {MAX_EVAL_CHARS} characters)."
+        out["expression"] = e
+    return out, None
 
 
 def _parse_and_validate_sequence(
@@ -387,6 +547,12 @@ def _parse_and_validate_sequence(
         elif action == "extract":
             pass
 
+        extra_fields: Dict[str, Any] = {}
+        if action in NEW_SEQUENCE_ACTIONS:
+            extra_fields, new_err = _parse_new_step_fields(idx, action, s)
+            if new_err:
+                return None, new_err
+
         # Parse preconditions and postconditions
         parsed_pre: List[SequenceCondition] = []
         parsed_post: List[SequenceCondition] = []
@@ -429,9 +595,10 @@ def _parse_and_validate_sequence(
                         return None, f"Step {idx} {c_field}[{c_idx}] expected value exceeds {MAX_CONDITION_TEXT_LEN} characters."
 
                 # Verify mandatory condition parameters
-                if ctype in ("element_exists", "element_visible") and not c_sel:
+                if ctype in ("element_exists", "element_visible", "element_hidden") and not c_sel:
                     return None, f"Step {idx} {c_field}[{c_idx}] ('{ctype}') requires 'selector'."
-                if ctype in ("url_contains", "url_matches", "title_contains", "title_matches", "text_contains") and c_exp is None:
+                if ctype in ("url_contains", "url_matches", "title_contains", "title_matches", "text_contains",
+                             "text_absent", "js_true") and c_exp is None:
                     return None, f"Step {idx} {c_field}[{c_idx}] ('{ctype}') requires 'expected' string."
                 if ctype == "value_matches":
                     if not c_sel:
@@ -454,6 +621,7 @@ def _parse_and_validate_sequence(
                 max_chars=max_chars,
                 preconditions=tuple(parsed_pre),
                 postconditions=tuple(parsed_post),
+                **extra_fields,
             )
         )
 
@@ -2702,11 +2870,36 @@ class ComexToolService:
                     return False, f"Element '{sel}' value is '{actual_val}', expected '{exp}'"
                 return True, None
 
+            elif ctype in ("js_true", "text_absent", "element_hidden"):
+                if ctype == "js_true":
+                    val = (await evaluate_readonly(session.cdp, exp, timeout_ms=800))["value"]
+                    return (True, None) if val else (False, f"Expression is not true (it evaluated to {str(val)[:80]!r})")
+                if ctype == "text_absent":
+                    present = (await evaluate_readonly(
+                        session.cdp, f"(document.body ? document.body.innerText : '').includes({json.dumps(exp)})", timeout_ms=800))["value"]
+                    return (False, f"Text {exp!r} is still visible") if present else (True, None)
+                state = (await evaluate_readonly(
+                    session.cdp, f"(() => {{ const e = document.querySelector({json.dumps(sel or '')}); if (!e) return 'missing'; "
+                                 f"const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 ? 'visible' : 'hidden'; }})()",
+                    timeout_ms=800))["value"]
+                return (False, f"Element '{sel}' is still visible") if state == "visible" else (True, None)
+
             else:
                 return False, f"Unknown condition type '{ctype}'"
 
         except Exception as e:
             return False, f"Error evaluating condition '{ctype}': {e}"
+
+    async def _poll_condition(self, session: Any, cond: SequenceCondition, context: ToolExecutionContext) -> Tuple[bool, Optional[str]]:
+        """Re-check a condition until it holds or the settle window ends (pages react a moment after an input)."""
+        deadline = time.monotonic() + SEQUENCE_POSTCONDITION_SETTLE_S
+        passed, err = False, None
+        while True:
+            context.check_active()
+            passed, err = await self._evaluate_condition(session, cond, context)
+            if passed or time.monotonic() >= deadline:
+                return passed, err
+            await asyncio.sleep(0.1)
 
     async def _execute_step_action(
         self,
@@ -2777,8 +2970,298 @@ class ComexToolService:
                 return data
             return ToolResult.ok(data=data, evidence={"action_dispatched": True, "mutating": False})
 
+        elif step.action in NEW_SEQUENCE_ACTIONS:
+            return await self._execute_new_step(session, step, context)
+
         else:
             return ToolResult.fail(ToolErrorCode.VALIDATION_ERROR, f"Unsupported action: {step.action}")
+
+    async def _execute_new_step(self, session: Any, step: SequenceStep, context: ToolExecutionContext) -> ToolResult:
+        """Input and observation steps of a sequence, run under the sequence's already-held tab lock."""
+        a = step.action
+        try:
+            if a == "evaluate":
+                r = await evaluate_readonly(session.cdp, step.expression or "")
+                return ToolResult.ok(data=r, evidence={"action_dispatched": False, "mutating": False})
+            if a == "wait":
+                r = await pio_wait_for(session.cdp, session.tracker.state, json.loads(step.wait_condition or "{}"),
+                                       timeout_ms=step.timeout_ms)
+                if not r["met"]:
+                    return ToolResult.fail(ToolErrorCode.OPERATION_FAILED, f"Wait condition not met: {r['detail']}",
+                                           evidence={"action_dispatched": False, "waited_ms": r["waited_ms"]})
+                return ToolResult.ok(data=r, evidence={"action_dispatched": False, "mutating": False})
+
+            await self._input_guard(session)
+            before = await self._page_fingerprint(session)
+            if a == "keys":
+                data = await pio_press_keys(session.cdp, plan_keys(list(step.keys), step.text))
+            elif a == "select":
+                data = await pio_select_option(session.cdp, step.selector or "", step.value or "")
+            elif a == "scroll":
+                if step.selector:
+                    data = await pio_scroll_into_view(session.cdp, step.selector)
+                else:
+                    vp = await measure_viewport(session.cdp)
+                    px = vp["width"] / 2 if step.x is None else step.x
+                    py = vp["height"] / 2 if step.y is None else step.y
+                    dy = (-100000.0 if step.scroll_to == "top" else 100000.0) if step.scroll_to else step.delta_y
+                    data = await pio_scroll_wheel(session.cdp, px, py, step.delta_x, dy)
+            else:  # pointer family
+                vp = await measure_viewport(session.cdp)
+                pts = [(step.x, step.y)] + ([(step.to_x, step.to_y)] if a == "drag" else [])
+                for (cx, cy) in pts:
+                    if not in_viewport(cx, cy, vp["width"], vp["height"]):
+                        raise PageIOError("out_of_bounds", f"The point ({cx:.0f}, {cy:.0f}) is outside the {vp['width']:.0f}x"
+                                          f"{vp['height']:.0f} viewport.")
+                kind = {"click_at": "click", "double_click_at": "double_click", "right_click_at": "right_click",
+                        "move_to": "move", "drag": "drag"}[a]
+                target = await describe_point(session.cdp, step.x, step.y) if kind != "move" else None
+                data = await pointer_action(session.cdp, kind, step.x, step.y, to_x=step.to_x, to_y=step.to_y,
+                                            cursor_hook=getattr(session.executor, "_visual_cursor_hook", None), tab_id=session.tab_id)
+                data["target"] = target
+            await asyncio.sleep(0.06)
+            data["page_changed"] = (await self._page_fingerprint(session)) != before
+            return ToolResult.ok(data=data, evidence={"action_dispatched": True})
+        except PageIOError as pe:
+            pre_dispatch = pe.code in ("validation", "blocked", "navigating", "out_of_bounds", "not_found", "side_effect")
+            code = ToolErrorCode.ACTION_BLOCKED if pe.code in ("blocked", "navigating", "out_of_bounds") else (
+                ToolErrorCode.VALIDATION_ERROR if pe.code == "validation" else ToolErrorCode.OPERATION_FAILED)
+            return ToolResult.fail(code, str(pe), evidence={"action_dispatched": not pre_dispatch and a in INPUT_SEQUENCE_ACTIONS,
+                                                            "page_io_code": pe.code})
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Hybrid perception and input (see nervous/page_io.py)
+    #
+    #  Every operation below uses the same authorization path as click/extract:
+    #  context claims, lease revalidation, canonical target check, per-tab action
+    #  lock, deadline and cancellation. Observation never changes the page;
+    #  input operations (press_keys, scroll, pointer) additionally refuse to act on
+    #  the Comex UI itself, on browser-internal pages, or mid-navigation.
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _run_session_op(
+        self,
+        context: ToolExecutionContext,
+        op_name: str,
+        body: Callable[[Any], Any],
+        *,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> ToolResult:
+        """Authorize, lock the tab, run `body(session)` and map every failure to a typed ToolResult."""
+        t0 = time.monotonic()
+        session, err_res = await self._authorize_and_resolve_session(context, op_name)
+        if err_res:
+            return err_res
+
+        async def _locked() -> Any:
+            async with session.action_lock:
+                auth_res = self._revalidate_locked_authority(context, op_name)
+                if auth_res is not None:
+                    return auth_res
+                context.check_active()
+                return await body(session)
+
+        def _dur() -> int:
+            return int((time.monotonic() - t0) * 1000)
+
+        try:
+            res = await self._run_with_context(context, _locked())
+            if isinstance(res, ToolResult):
+                return res
+            return ToolResult.ok(data=_with_dialog(session, res), evidence=evidence, duration_ms=_dur())
+        except asyncio.CancelledError:
+            if context.is_cancelled():
+                return ToolResult.fail(ToolErrorCode.CANCELLED, f"{op_name} cancelled for task '{context.task_id}'.",
+                                       retryable=False, duration_ms=_dur())
+            raise
+        except TimeoutError as te:
+            return ToolResult.fail(ToolErrorCode.DEADLINE_EXCEEDED, str(te), retryable=False, duration_ms=_dur())
+        except PageIOError as pe:
+            code = ToolErrorCode.VALIDATION_ERROR if pe.code == "validation" else (
+                ToolErrorCode.ACTION_BLOCKED if pe.code in ("blocked", "navigating", "stale_screenshot", "out_of_bounds")
+                else ToolErrorCode.OPERATION_FAILED)
+            return ToolResult.fail(code, str(pe), retryable=pe.code in ("navigating", "timeout"), duration_ms=_dur(),
+                                   evidence={"page_io_code": pe.code, **pe.detail})
+        except Exception as e:
+            logger.error(f"Error in {op_name}: {e}")
+            return ToolResult.fail(ToolErrorCode.OPERATION_FAILED, f"Error in {op_name}: {e}", retryable=False,
+                                   duration_ms=_dur())
+
+    async def _input_guard(self, session: Any) -> None:
+        """Checks that apply to every action not tied to a DOM element (keys, wheel, coordinates)."""
+        try:
+            await session.flush_and_sync()
+        except Exception:
+            pass  # a stale tracker must not block input; the checks below use what we have
+        st = session.tracker.state
+        url = str(getattr(st, "current_url", "") or "")
+        if is_trusted_ui_target_url(url):
+            raise PageIOError("blocked", "This tab is the Comex interface itself; agents may not send input to it.")
+        if url.startswith(("chrome://", "devtools://", "chrome-extension://", "chrome-untrusted://", "view-source:")):
+            raise PageIOError("blocked", "Agents may not send input to browser-internal pages.")
+        if getattr(st, "is_navigating", False):
+            raise PageIOError("navigating", "The page is still navigating. Call browser_wait with {\"type\": \"idle\"} and try again.")
+
+    async def _page_fingerprint(self, session: Any) -> Any:
+        try:
+            return (await evaluate_readonly(session.cdp, _FINGERPRINT_JS, timeout_ms=600))["value"]
+        except PageIOError:
+            return None
+
+    async def evaluate(self, context: ToolExecutionContext, expression: str, max_chars: int = 12000,
+                       timeout_ms: int = 1500) -> ToolResult:
+        """Run a JavaScript expression in the page under V8's side-effect-free mode (cannot change the page)."""
+        async def body(session: Any) -> Any:
+            return await evaluate_readonly(session.cdp, expression, timeout_ms=timeout_ms, max_chars=max_chars)
+        return await self._run_session_op(context, "evaluate", body, evidence={"mode": "read_only_engine_enforced"})
+
+    async def read_table(self, context: ToolExecutionContext, selector: Optional[str] = None, table_index: Optional[int] = None,
+                         start_row: int = 0, max_rows: int = 500) -> ToolResult:
+        """Read table(s) completely, with explicit completeness information. Read-only."""
+        async def body(session: Any) -> Any:
+            data = await pio_read_table(session.cdp, selector=selector, table_index=table_index, start_row=start_row,
+                                        max_rows=max_rows)
+            st = session.tracker.state
+            data["state_version"] = {"document_generation": getattr(st, "document_generation", 0),
+                                     "dom_revision": getattr(st, "dom_revision", 0)}
+            return data
+        return await self._run_session_op(context, "read_table", body, evidence={"mode": "read_only_engine_enforced"})
+
+    async def screenshot(self, context: ToolExecutionContext) -> ToolResult:
+        """Capture the visible viewport; remembers its geometry so coordinates taken from it can be validated."""
+        async def body(session: Any) -> Any:
+            st = session.tracker.state
+            info, b64 = await capture_screenshot(session.cdp, document_generation=getattr(st, "document_generation", 0))
+            session.last_viewport = info
+            return {
+                "image_base64": b64, "mime": "image/jpeg", "screenshot_id": info.screenshot_id,
+                "width": info.screenshot_width, "height": info.screenshot_height,
+                "viewport": {"width": info.viewport_width, "height": info.viewport_height,
+                             "scroll_x": info.scroll_x, "scroll_y": info.scroll_y, "dpr": info.device_pixel_ratio},
+                "note": ("Point at pixels of THIS image and pass screenshot_id to browser_pointer. The id stops being valid "
+                         "if the page navigates, scrolls or resizes; then take a new screenshot."),
+            }
+        return await self._run_session_op(context, "screenshot", body)
+
+    async def observe(self, context: ToolExecutionContext) -> ToolResult:
+        """Compact page state plus a deterministic hint about which interaction strategy fits the page. Read-only."""
+        async def body(session: Any) -> Any:
+            st = session.tracker.state
+            probe = await evaluate_readonly(session.cdp, _PERCEPTION_JS, timeout_ms=1500)
+            vp = await measure_viewport(session.cdp)
+            facts = probe["value"] or {}
+            facts["viewport"] = {"width": vp["width"], "height": vp["height"], "scroll_x": vp["scroll_x"],
+                                 "scroll_y": vp["scroll_y"], "dpr": vp["dpr"]}
+            facts["state_version"] = {"document_generation": getattr(st, "document_generation", 0),
+                                      "dom_revision": getattr(st, "dom_revision", 0)}
+            facts["strategy"] = choose_strategy(facts)
+            facts["grid"] = describe_grid(facts.get("surface"))
+            return facts
+        return await self._run_session_op(context, "observe", body)
+
+    async def wait_for(self, context: ToolExecutionContext, condition: Dict[str, Any], timeout_ms: int = 5000) -> ToolResult:
+        """Wait on a typed page condition (idle, text, selector, js, url) instead of sleeping. Read-only."""
+        async def body(session: Any) -> Any:
+            if not isinstance(condition, dict) or "type" not in condition:
+                raise PageIOError("validation", "condition must be an object with a 'type'.")
+            return await pio_wait_for(session.cdp, session.tracker.state, condition, timeout_ms=timeout_ms)
+        return await self._run_session_op(context, "wait_for", body)
+
+    async def select_option(self, context: ToolExecutionContext, selector: str, value: str) -> ToolResult:
+        """Choose an option in a native dropdown by value or visible text (fires input and change events)."""
+        async def body(session: Any) -> Any:
+            await self._input_guard(session)
+            before = await self._page_fingerprint(session)
+            out = await pio_select_option(session.cdp, selector, value)
+            await asyncio.sleep(0.08)
+            out["page_changed"] = (await self._page_fingerprint(session)) != before
+            return out
+        return await self._run_session_op(context, "select_option", body)
+
+    async def press_keys(self, context: ToolExecutionContext, keys: Optional[List[str]] = None, text: Optional[str] = None,
+                         delay_ms: int = 25) -> ToolResult:
+        """Press keys or chords in the focused element; `text` is typed as individual key presses (for games)."""
+        plan = None
+        try:
+            plan = plan_keys(keys or [], text)
+        except PageIOError as pe:
+            return ToolResult.fail(ToolErrorCode.VALIDATION_ERROR, str(pe), retryable=False)
+
+        async def body(session: Any) -> Any:
+            await self._input_guard(session)
+            before = await self._page_fingerprint(session)
+            out = await pio_press_keys(session.cdp, plan, delay_ms=delay_ms)
+            await asyncio.sleep(0.05)
+            out["page_changed"] = (await self._page_fingerprint(session)) != before
+            return out
+        return await self._run_session_op(context, "press_keys", body)
+
+    async def scroll(self, context: ToolExecutionContext, delta_y: float = 0, delta_x: float = 0, x: Optional[float] = None,
+                     y: Optional[float] = None, selector: Optional[str] = None, to: Optional[str] = None) -> ToolResult:
+        """Scroll with the mouse wheel at a point, to the top/bottom, or an element into view (selector)."""
+        async def body(session: Any) -> Any:
+            await self._input_guard(session)
+            if selector:
+                return await pio_scroll_into_view(session.cdp, selector.strip())
+            vp = await measure_viewport(session.cdp)
+            px = vp["width"] / 2 if x is None else float(x)
+            py = vp["height"] / 2 if y is None else float(y)
+            if not in_viewport(px, py, vp["width"], vp["height"]):
+                raise PageIOError("out_of_bounds", f"({px:.0f}, {py:.0f}) is outside the {vp['width']:.0f}x{vp['height']:.0f} viewport.")
+            dy, dx = float(delta_y), float(delta_x)
+            if to in ("top", "bottom"):
+                dy = -100000.0 if to == "top" else 100000.0
+            elif to is not None:
+                raise PageIOError("validation", "to must be 'top' or 'bottom'.")
+            if dy == 0 and dx == 0:
+                raise PageIOError("validation", "give delta_y/delta_x, to='top'|'bottom', or a selector.")
+            return await pio_scroll_wheel(session.cdp, px, py, dx, dy)
+        return await self._run_session_op(context, "scroll", body)
+
+    async def pointer(self, context: ToolExecutionContext, action: str, x: float, y: float, *, to_x: Optional[float] = None,
+                      to_y: Optional[float] = None, screenshot_id: Optional[str] = None, button: str = "left") -> ToolResult:
+        """
+        Mouse input at coordinates: click, double_click, right_click, move, drag.
+        With `screenshot_id` the coordinates are in that screenshot's pixels and are refused if the viewport, the
+        document or the scroll position changed since it was taken. Without it they are CSS viewport pixels
+        (for example computed from element rectangles read with browser_evaluate).
+        """
+        async def body(session: Any) -> Any:
+            await self._input_guard(session)
+            vp = await measure_viewport(session.cdp)
+            px, py, qx, qy = float(x), float(y), to_x, to_y
+            for v in (px, py) + ((float(qx), float(qy)) if qx is not None and qy is not None else ()):
+                if v != v or v in (float("inf"), float("-inf")):
+                    raise PageIOError("validation", "coordinates must be finite numbers.")
+            if screenshot_id:
+                info = getattr(session, "last_viewport", None)
+                if info is None or info.screenshot_id != screenshot_id:
+                    raise PageIOError("stale_screenshot", "That screenshot is no longer the latest one for this tab. "
+                                      "Take a new screenshot with browser_screenshot and point again.")
+                why = drift_reason(info, vp["width"], vp["height"], getattr(session.tracker.state, "document_generation", 0),
+                                   (vp["scroll_x"], vp["scroll_y"]))
+                if why:
+                    raise PageIOError("stale_screenshot", f"Nothing was clicked because {why}. Take a new screenshot and point again.")
+                px, py = screenshot_to_viewport(px, py, info)
+                if qx is not None and qy is not None:
+                    qx, qy = screenshot_to_viewport(float(qx), float(qy), info)
+            for (cx, cy) in ((px, py),) + (((float(qx), float(qy)),) if qx is not None and qy is not None else ()):
+                if not in_viewport(cx, cy, vp["width"], vp["height"]):
+                    raise PageIOError("out_of_bounds", f"The point ({cx:.0f}, {cy:.0f}) is outside the {vp['width']:.0f}x"
+                                      f"{vp['height']:.0f} viewport. Scroll first or take a new screenshot.")
+            target = await describe_point(session.cdp, px, py) if action != "move" else None
+            before = await self._page_fingerprint(session)
+            out = await pointer_action(
+                session.cdp, action, px, py, to_x=qx, to_y=qy, button=button,
+                cursor_hook=getattr(session.executor, "_visual_cursor_hook", None), tab_id=session.tab_id)
+            await asyncio.sleep(0.08)
+            out.update({"x": round(px, 1), "y": round(py, 1), "target": target,
+                        "page_changed": (await self._page_fingerprint(session)) != before})
+            if qx is not None:
+                out["to"] = {"x": round(float(qx), 1), "y": round(float(qy), 1),
+                             "target": await describe_point(session.cdp, float(qx), float(qy))}
+            return out
+        return await self._run_session_op(context, "pointer", body)
 
     async def perform_sequence(self, context: ToolExecutionContext, steps: List[Any]) -> ToolResult:
         """
@@ -2828,7 +3311,7 @@ class ComexToolService:
                     # 1. Authoritative permission re-check for this step's specific action
                     auth_err = self._context_authority.validate_context_claims(
                         context,
-                        step.action,
+                        _operation_for_step(step.action),
                         current_lease_token=context.lease.lease_token if context.lease else None,
                     )
                     if auth_err:
@@ -2892,7 +3375,7 @@ class ComexToolService:
                     # 3b. Revalidate both context authority and active worker lease immediately before executing action (after preconditions)
                     auth_err_pre_exec = self._context_authority.validate_context_claims(
                         context,
-                        step.action,
+                        _operation_for_step(step.action),
                         current_lease_token=context.lease.lease_token if context.lease else None,
                     )
                     if auth_err_pre_exec:
@@ -3020,6 +3503,8 @@ class ComexToolService:
                     context.check_active()
                     for cond in step.postconditions:
                         passed, cond_err = await self._evaluate_condition(session, cond, context)
+                        if not passed and step.action in NEW_SEQUENCE_ACTIONS:
+                            passed, cond_err = await self._poll_condition(session, cond, context)
                         if not passed:
                             return ToolResult.fail(
                                 ToolErrorCode.OPERATION_FAILED,
