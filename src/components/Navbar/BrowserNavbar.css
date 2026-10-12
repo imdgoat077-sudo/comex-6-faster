@@ -140,27 +140,24 @@
 
 .tab-audio-indicator { display: flex; color: var(--text-2); flex-shrink: 0; }
 
-/* Agent tabs: the status colour is the only colour in the tab strip */
+/* Agent tabs: one quiet cue. The badge takes the status colour and a thin underline breathes
+   while the agent works; the hover card carries the detail. */
 .tab-agent-badge {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
-  border-radius: var(--radius-sm);
   color: var(--text-3);
+  transition: color 0.3s ease;
 }
-
-.agent-working .tab-agent-badge { color: var(--status-run); background: rgba(229, 180, 74, 0.14); }
-.agent-working .tab-agent-badge svg { animation: pulse 1.6s ease-in-out infinite; }
+.agent-working .tab-agent-badge { color: var(--status-run); }
 .agent-completed .tab-agent-badge { color: var(--status-ok); }
 .agent-failed .tab-agent-badge,
-.agent-cancelled .tab-agent-badge,
 .agent-blocked .tab-agent-badge { color: var(--status-err); }
 
-.agent-working::after {
-  content: '';
+.tab-agent-track {
   position: absolute;
   left: 10px;
   right: 10px;
@@ -168,7 +165,74 @@
   height: 2px;
   border-radius: 2px;
   background: var(--status-run);
+  animation: tab-breathe 2.6s ease-in-out infinite;
 }
+@keyframes tab-breathe { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.9; } }
+
+.agent-completed::after {
+  content: '';
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--status-ok);
+  animation: tab-done 2s ease forwards;
+}
+@keyframes tab-done { 0%, 50% { opacity: 0.9; } 100% { opacity: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-agent-track { animation: none; opacity: 0.8; }
+}
+
+/* Hover card: what the agent is doing right now */
+.agent-card {
+  position: fixed;
+  z-index: 200;
+  width: 300px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-pop);
+  pointer-events: none;
+  animation: card-in 0.28s var(--ease-out) both;
+  -webkit-app-region: no-drag;
+}
+@keyframes card-in { from { opacity: 0; transform: translateY(-4px) scale(0.98); } to { opacity: 1; transform: none; } }
+
+.agent-card-head { display: flex; align-items: center; gap: 8px; }
+@keyframes agent-ping { 0% { transform: scale(1); opacity: 0.7; } 80%, 100% { transform: scale(2.6); opacity: 0; } }
+.agent-card-dot { position: relative; width: 8px; height: 8px; flex-shrink: 0; border-radius: 50%; background: var(--text-3); }
+.agent-card-working .agent-card-dot { background: var(--status-run); }
+.agent-card-working .agent-card-dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--status-run);
+  animation: agent-ping 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.agent-card-completed .agent-card-dot { background: var(--status-ok); }
+.agent-card-failed .agent-card-dot,
+.agent-card-blocked .agent-card-dot { background: var(--status-err); }
+
+.agent-card-title { flex: 1; color: var(--text-1); font-size: var(--text-md); font-weight: 600; }
+.agent-card-time { color: var(--text-3); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.agent-card-task { margin-top: 8px; color: var(--text-2); font-size: var(--text-sm); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.agent-card-step {
+  margin-top: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  color: var(--text-1);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+  animation: card-step 0.35s var(--ease-out) both;
+}
+@keyframes card-step { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.agent-card-host { margin-top: 8px; color: var(--text-3); font-size: var(--text-xs); }
 
 .add-tab-btn {
   display: flex;

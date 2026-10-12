@@ -4,6 +4,7 @@ Tests for LLM-driven task decomposition in services/orchestrator.py.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -91,3 +92,33 @@ async def test_decomposition_null_follow_up_and_unsafe_ids():
     plan = await decompose_request_via_llm("What is on HN?", llm)
     assert plan.follow_up_action is None
     assert plan.tasks[0].id == "hn_top_story_"
+
+
+async def test_decomposition_reads_work_packages_and_drops_overlap():
+    llm = _mock_llm(json.dumps({"subtasks": [
+        {"id": "surveys", "objective": "Find survey papers on multi-agent orchestration since 2023",
+         "sources": "arXiv, Semantic Scholar", "method": ["Search arXiv", "Extract results"],
+         "collect": "title, year, link", "url": "https://arxiv.org/search/?query=survey"},
+        {"id": "surveys_again", "objective": "Find survey papers on multi-agent orchestration since 2023!"},
+        {"id": "benchmarks", "objective": "Find benchmark and evaluation papers for multi-agent systems",
+         "method": "Search Semantic Scholar for benchmarks"},
+    ], "follow_up_action": None}))
+    plan = await decompose_request_via_llm("best papers on multi-agent orchestration", llm, max_tasks=4)
+
+    assert [t.id for t in plan.tasks] == ["surveys", "benchmarks"]  # duplicate objective dropped
+    surveys = plan.tasks[0]
+    assert surveys.description.startswith("Find survey papers")
+    assert surveys.metadata["package"] == {"sources": "arXiv, Semantic Scholar",
+                                           "method": ["Search arXiv", "Extract results"],
+                                           "collect": "title, year, link"}
+    assert surveys.url == "https://arxiv.org/search/?query=survey"
+    assert plan.tasks[1].metadata["package"]["method"] == ["Search Semantic Scholar for benchmarks"]
+
+
+async def test_planner_prompt_splits_by_facet_and_forbids_item_lists():
+    llm = _mock_llm('[{"id": "t1", "description": "x"}]')
+    await decompose_request_via_llm("anything", llm)
+    prompt = llm.ainvoke.await_args.args[0][0]["content"]
+    assert "NOT by website" in prompt
+    assert "No two packages may search for the same thing" in prompt
+    assert "Never list individual items" in prompt

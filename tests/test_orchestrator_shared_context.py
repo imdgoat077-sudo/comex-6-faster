@@ -45,16 +45,90 @@ def _task(task_id: str, findings=None, error=None, sources=None) -> Orchestrator
     return OrchestratorTask(id=task_id, description=f"Research {task_id}", task_fn=fn)
 
 
-def test_worker_brief_contains_goal_own_subtask_and_siblings():
-    a = OrchestratorTask(id="a", description="Price of the Pixel 8", url="https://store.google.com")
-    b = OrchestratorTask(id="b", description="Price of the iPhone 15")
-    brief = build_worker_brief("Compare Pixel 8 and iPhone 15 prices", a, [a, b])
+@pytest.fixture(autouse=True)
+def _isolate_service_singletons():
+    """Some tests run the agent loop without a graph store; the shared tool service keeps the store it was
+    created with by design, so don't let one created here leak into later tests."""
+    import agent_service as _as
+    saved = (_as._comex_tool_service, _as._orchestrator_instance)
+    yield
+    _as._comex_tool_service, _as._orchestrator_instance = saved
 
-    assert "Compare Pixel 8 and iPhone 15 prices" in brief
-    assert "YOUR SUBTASK: Price of the Pixel 8" in brief
-    assert "already open at https://store.google.com" in brief
-    assert "- Price of the iPhone 15" in brief
-    assert "one of 2 browser agents" in brief
+
+def test_worker_brief_is_a_precise_non_overlapping_work_package():
+    a = OrchestratorTask(
+        id="surveys",
+        description="Find survey papers (2023+) on LLM multi-agent orchestration",
+        url="https://arxiv.org/search/?query=survey",
+        metadata={"package": {
+            "sources": "arXiv, Semantic Scholar",
+            "method": ["Search arXiv for surveys", "Extract the result list", "Check citation counts of the top 5"],
+            "collect": "title, authors, year, venue, link, citations",
+        }},
+    )
+    b = OrchestratorTask(id="systems", description="Find papers introducing multi-agent orchestration frameworks")
+    brief = build_worker_brief("Find the best papers on multi-agent orchestration", a, [a, b])
+
+    assert "YOUR OBJECTIVE: Find survey papers (2023+) on LLM multi-agent orchestration" in brief
+    assert "WHERE TO SEARCH: arXiv, Semantic Scholar" in brief
+    assert "1. Search arXiv for surveys" in brief and "3. Check citation counts of the top 5" in brief
+    assert "COLLECT FOR EVERY RESULT: title, authors, year, venue, link, citations" in brief
+    assert "already open at https://arxiv.org/search/?query=survey" in brief
+    # The other agent's responsibility is an explicit exclusion; its own objective is not
+    owned = brief.split("OWNED BY OTHER AGENTS")[1].split("HOW TO WORK")[0]
+    assert "Find papers introducing multi-agent orchestration frameworks" in owned
+    assert "survey" not in owned.lower()
+    # Budget and structured output contract
+    assert "limited number of browser actions" in brief
+    assert "### Findings" in brief and "### Coverage" in brief and "### Limitations" in brief
+
+
+def test_worker_brief_has_default_steps_without_a_package():
+    a = OrchestratorTask(id="a", description="Price of the Pixel 8")
+    brief = build_worker_brief("Compare phone prices", a, [a])
+    assert "STEPS:" in brief and "1. Run a search" in brief
+    assert "OWNED BY OTHER AGENTS" not in brief
+
+
+async def test_synthesis_gets_each_objective_and_keeps_all_findings():
+    llm = _llm("merged")
+    orch = _orchestrator(llm=llm)
+    run = orch.create_run("Find papers", [
+        _task("surveys", findings="### Findings\n- [Survey A](https://arxiv.org/abs/2401.00001)"),
+        _task("systems", findings="### Findings\n- [MetaGPT](https://arxiv.org/abs/2308.00352)"),
+    ])
+    await orch.execute_run(run)
+    system = llm.ainvoke.await_args.args[0][0]["content"]
+    user = llm.ainvoke.await_args.args[0][1]["content"]
+    assert "Agent objective: Research surveys" in user and "Agent objective: Research systems" in user
+    assert "Survey A" in user and "MetaGPT" in user
+    assert "Deduplicate" in system and "do not drop useful" in system
+
+
+async def test_workers_run_concurrently_and_timing_is_reported():
+    started = []
+    both_started = asyncio.Event()
+
+    def worker(name):
+        async def fn(ctx, svc):
+            started.append(name)
+            if len(started) == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=2)  # deadlocks if run one after another
+            return WorkerResult(findings=name, success=True, tool_calls_count=3, llm_calls=4, avg_llm_ms=900.0)
+        return fn
+
+    orch = _orchestrator(llm=_llm("merged"))
+    run = orch.create_run("q", [OrchestratorTask(id="a", description="A", task_fn=worker("a")),
+                                OrchestratorTask(id="b", description="B", task_fn=worker("b"))])
+    run.planning_ms = 1234.0
+    result = await orch.execute_run(run)
+
+    assert sorted(started) == ["a", "b"]
+    t = result.timing
+    assert t["planning_ms"] == 1234.0 and t["synthesis_ms"] >= 0 and t["total_ms"] >= 1234.0
+    assert t["workers"]["a"]["tool_calls"] == 3 and t["workers"]["a"]["llm_calls"] == 4
+    assert t["workers"]["a"]["duration_ms"] is not None
 
 
 async def test_final_answer_compares_all_findings_with_one_llm_call():

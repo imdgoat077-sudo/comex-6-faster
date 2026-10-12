@@ -18,7 +18,8 @@ contextBridge.exposeInMainWorld('nexusNative', {
     createHiddenAgentTab: (tabId, url) => ipcRenderer.send('tabs-create-hidden-agent', tabId, url),
     destroyHiddenAgentTab: (tabId) => ipcRenderer.send('tabs-destroy-hidden-agent', tabId),
     openAgentTab: (tabId, url, label) => ipcRenderer.invoke('tabs-open-agent', { tabId, url, label }),
-    setAgentStatus: (tabId, status) => ipcRenderer.send('tabs-set-agent-status', tabId, status),
+    setAgentStatus: (tabId, status, step) => ipcRenderer.send('tabs-set-agent-status', tabId, status, step),
+    setAgentStep: (tabId, step) => ipcRenderer.send('tabs-set-agent-step', tabId, step),
     onUpdate: (callback) => {
       ipcRenderer.removeAllListeners('tab-update');
       ipcRenderer.on('tab-update', (event, tabId, data) => callback(tabId, data));

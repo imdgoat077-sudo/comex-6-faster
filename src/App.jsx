@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import BrowserNavbar from './components/Navbar/BrowserNavbar';
 import BookmarksBar from './components/Bookmarks/BookmarksBar';
 import BrowserCanvas from './components/Canvas/BrowserCanvas';
-import ChatDrawer from './components/Chat/ChatDrawer';
+import ChatDrawer, { DRAWER_WIDTH } from './components/Chat/ChatDrawer';
 import ShortcutsModal from './components/Modals/ShortcutsModal';
 import { classifyIntent } from './agents/IntentClassifier';
 import './App.css';
@@ -25,6 +25,7 @@ export default function App() {
 
   const [activeTabId, setActiveTabId] = useState('tab-1');
   const [isChatOpen, setIsChatOpen] = useState(false);
+  const [drawerWidth, setDrawerWidth] = useState(DRAWER_WIDTH);
   const [unreadCount, setUnreadCount] = useState(0);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [landingHistory, setLandingHistory] = useState([]);
@@ -56,8 +57,16 @@ export default function App() {
             canGoForward: false,
             agentStatus: 'working',
             agentLabel: data.label,
+            agentStep: '',
+            agentSince: Date.now(),
           }]);
           if (shouldFocus) setActiveTabId(data.tabId);
+          return;
+        }
+
+        // "Stop" pressed on the agent shield over the page
+        if (data.agentStopRequested) {
+          window.dispatchEvent(new CustomEvent('comex-agent-stop'));
           return;
         }
 
@@ -103,6 +112,8 @@ export default function App() {
               canGoBack: data.canGoBack !== undefined ? data.canGoBack : tab.canGoBack,
               canGoForward: data.canGoForward !== undefined ? data.canGoForward : tab.canGoForward,
               agentStatus: data.agentStatus !== undefined ? data.agentStatus : tab.agentStatus,
+              agentStep: data.agentStep !== undefined ? data.agentStep : tab.agentStep,
+              agentSince: data.agentStatus === 'working' && tab.agentStatus !== 'working' ? Date.now() : tab.agentSince,
             };
           }
           return tab;
@@ -334,7 +345,14 @@ export default function App() {
   // - research -> keep the user on the landing page / sidebar chat flow.
   // - visible_browser_task -> create a visible tab and switch workspaces.
   // Ambiguous requests default safely to research.
-  const handleLandingPrompt = async (prompt) => {
+  const handleLandingPrompt = async (prompt, mode = 'single') => {
+    // Multi-agent runs open their own tabs, so there is no tab intent to classify.
+    if (mode === 'multi') {
+      setIsChatOpen(true);
+      window.dispatchEvent(new CustomEvent('comex-landing-prompt', { detail: { prompt, mode } }));
+      return;
+    }
+
     const lowerPrompt = prompt.toLowerCase();
     const isHiddenExamplePoc = lowerPrompt.includes('hidden background tab')
       && lowerPrompt.includes('example.com')
@@ -404,7 +422,7 @@ export default function App() {
 
         // Pre-emptively adjust bounds for chat drawer before tab activation
         if (window.nexusNative?.tabs?.setBounds) {
-          const chatWidth = Math.min(440, Math.round(window.innerWidth * 0.92));
+          const chatWidth = Math.min(drawerWidth, Math.round(window.innerWidth * 0.92));
           window.nexusNative.tabs.setBounds({
             x: 0,
             y: 138,
@@ -437,23 +455,23 @@ export default function App() {
 
         requestAnimationFrame(() => {
           window.dispatchEvent(new CustomEvent('comex-landing-prompt', {
-            detail: { prompt, visibleTabId: newTabId, intent }
+            detail: { prompt, visibleTabId: newTabId, intent, mode }
           }));
         });
         return;
       }
 
       setIsChatOpen(true);
-      window.dispatchEvent(new CustomEvent('comex-landing-prompt', { detail: { prompt, intent } }));
+      window.dispatchEvent(new CustomEvent('comex-landing-prompt', { detail: { prompt, intent, mode } }));
     } catch (err) {
       console.error('Intent classification failed:', err);
       setIsChatOpen(true);
-      window.dispatchEvent(new CustomEvent('comex-landing-prompt', { detail: { prompt } }));
+      window.dispatchEvent(new CustomEvent('comex-landing-prompt', { detail: { prompt, mode } }));
     }
   };
 
   return (
-    <div className="nexus-app-container">
+    <div className="nexus-app-container" style={{ '--drawer-w': `${drawerWidth}px` }}>
       {/* Master Header Bar */}
       <BrowserNavbar
         tabs={tabs}
@@ -493,6 +511,8 @@ export default function App() {
           onClose={() => setIsChatOpen(false)}
           activeTab={activeTab}
           onSelectTab={handleSelectTab}
+          width={drawerWidth}
+          onWidthChange={setDrawerWidth}
         />
       </div>
 

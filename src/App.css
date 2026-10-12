@@ -27,5 +27,11 @@
 
 /* Keep in-app pages (new tab) clear of the assistant drawer; the native page view is sized separately in BrowserCanvas */
 .browser-canvas-area.with-drawer {
-  margin-right: min(440px, 92vw);
+  margin-right: min(var(--drawer-w, 440px), 92vw);
 }
+
+/* Width changes animate together so the native page view (sized from these boxes) follows smoothly */
+.browser-canvas-area { transition: margin-right 0.32s var(--ease-out); }
+.drawer-resizing .browser-canvas-area,
+.drawer-resizing .chat-drawer { transition: none; }
+.drawer-resizing { cursor: col-resize; user-select: none; }

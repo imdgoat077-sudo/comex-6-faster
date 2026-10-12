@@ -78,7 +78,6 @@ export default function BrowserCanvas({
         isHidden: hidden,
       };
 
-      console.log('[CANVAS] Sending bounds to main process:', JSON.stringify(bounds));
       window.nexusNative.tabs.setBounds(bounds);
     };
 

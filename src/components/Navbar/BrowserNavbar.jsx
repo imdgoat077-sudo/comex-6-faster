@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   ArrowLeft, ArrowRight, RotateCw, Home, Lock, Star,
-  Plus, X, Sparkles, Search, Globe, HelpCircle, Volume2, Bot
+  Plus, X, Sparkles, Search, Globe, HelpCircle, Volume2, Bot, Check
 } from 'lucide-react';
 import './BrowserNavbar.css';
 
@@ -13,6 +13,42 @@ const QUICK_SITES = [
   { url: 'https://en.wikipedia.org', title: 'Wikipedia', host: 'wikipedia.org' },
   { url: 'https://news.ycombinator.com', title: 'Hacker News', host: 'news.ycombinator.com' },
 ];
+
+function hostOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+
+function elapsedText(since, now) {
+  if (!since) return '';
+  const s = Math.max(0, Math.round((now - since) / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+// Hover card for an agent tab. Fixed-position because the tab strip clips its children.
+function AgentTabCard({ tab, anchor }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (tab.agentStatus !== 'working') return undefined;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [tab.agentStatus]);
+  const label = AGENT_STATUS_LABEL[tab.agentStatus];
+  const host = hostOf(tab.url);
+  const step = tab.agentStatus === 'working' ? (tab.agentStep || 'Starting') : null;
+  const left = Math.max(8, Math.min(anchor.left, window.innerWidth - 308));
+  return (
+    <div className={`agent-card agent-card-${tab.agentStatus}`} style={{ left, top: anchor.bottom + 6 }} role="status">
+      <div className="agent-card-head">
+        <span className="agent-card-dot" aria-hidden="true" />
+        <span className="agent-card-title">{label}</span>
+        {tab.agentStatus === 'working' && <span className="agent-card-time">{elapsedText(tab.agentSince, now)}</span>}
+      </div>
+      {tab.agentLabel && <p className="agent-card-task">{tab.agentLabel}</p>}
+      {step && <p className="agent-card-step" key={step}>{step}</p>}
+      {host && <p className="agent-card-host">{host}</p>}
+    </div>
+  );
+}
 
 const AGENT_STATUS_LABEL = {
   working: 'Agent working in this tab',
@@ -49,6 +85,7 @@ export default function BrowserNavbar({
   const [isFocused, setIsFocused] = useState(false);
   const [isBookmarked, setIsBookmarked] = useState(false);
   const inputRef = useRef(null);
+  const [cardTab, setCardTab] = useState(null); // { id, left, bottom } of the agent tab being hovered
 
   useEffect(() => {
     if (activeTab) {
@@ -91,6 +128,11 @@ export default function BrowserNavbar({
           </div>
         )}
 
+        {cardTab && (() => {
+          const hovered = tabs.find((t) => t.id === cardTab.id);
+          return hovered && hovered.agentStatus ? <AgentTabCard tab={hovered} anchor={cardTab} /> : null;
+        })()}
+
         <div className="tabs-container" role="tablist" aria-label="Open tabs">
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
@@ -104,7 +146,9 @@ export default function BrowserNavbar({
                 className={`browser-tab ${isActive ? 'active' : ''} ${tab.agentStatus ? `agent-tab agent-${tab.agentStatus}` : ''}`}
                 onClick={() => onSelectTab(tab.id)}
                 onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTab(tab.id); } }}
-                title={tab.agentLabel ? `${agentLabel}: ${tab.agentLabel}\n${tab.url}` : tab.url}
+                onMouseEnter={tab.agentStatus ? (e) => { const r = e.currentTarget.getBoundingClientRect(); setCardTab({ id: tab.id, left: r.left, bottom: r.bottom }); } : undefined}
+                onMouseLeave={tab.agentStatus ? () => setCardTab(null) : undefined}
+                title={tab.agentStatus ? undefined : tab.url}
               >
                 <span className="tab-favicon">
                   {tab.isLoading ? (
@@ -117,10 +161,11 @@ export default function BrowserNavbar({
                 </span>
                 {tab.agentStatus && (
                   <span className="tab-agent-badge" aria-label={agentLabel}>
-                    <Bot size={11} />
+                    {tab.agentStatus === 'completed' ? <Check size={11} strokeWidth={2.5} /> : <Bot size={11} />}
                   </span>
                 )}
                 <span className="tab-title">{tab.title || 'New tab'}</span>
+                {tab.agentStatus === 'working' && <span className="tab-agent-track" aria-hidden="true" />}
                 {tab.isAudible && (
                   <span className="tab-audio-indicator" aria-label="Playing audio">
                     <Volume2 size={12} />

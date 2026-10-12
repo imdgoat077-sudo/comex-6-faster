@@ -203,6 +203,58 @@ button, input, textarea, select {
 
 .glass-input:focus { border-color: var(--accent); }
 
+/* Segmented control (agent mode on the new-tab page and in the assistant) */
+.mode-switch {
+  position: relative;
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  padding: 2px;
+  gap: 2px;
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  border: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+/* The selected background slides between options */
+.mode-thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 3px);
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05) inset, 0 1px 2px rgba(0, 0, 0, 0.3);
+  transform: translateX(calc(var(--idx, 0) * (100% + 2px)));
+  transition: transform 0.32s var(--ease-out);
+}
+
+.mode-option {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+.mode-option:hover:not(:disabled):not(.selected) { color: var(--text-1); }
+.mode-option.selected { color: var(--text-1); }
+.mode-option:disabled { cursor: default; }
+.mode-option:disabled:not(.selected) { opacity: 0.5; }
+
 /* Tooltips */
 [data-tooltip] { position: relative; }
 

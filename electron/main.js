@@ -169,6 +169,7 @@ function syncActiveView() {
   // If no view should be shown (internal URL or no active tab), we're done
   if (!shouldShowView) {
     resetVisualCursor();
+    updateAgentShield();
     console.log('[SYNC] No view to show. All views detached. React UI fully visible.');
     return;
   }
@@ -222,6 +223,7 @@ function syncActiveView() {
     console.log('[SYNC] Focused active view');
   }
 
+  updateAgentShield();
   console.log('[SYNC] syncActiveView completed');
 }
 
@@ -478,6 +480,80 @@ async function getDevToolsTargetId(webContents) {
 const AGENT_TAB_ID_PATTERN = /^[a-zA-Z0-9_\-:]{1,100}$/;
 const AGENT_TAB_STATUSES = new Set(['working', 'completed', 'failed', 'cancelled', 'blocked']);
 
+// ---------------------------------------------------------------------------------------------
+// Agent shield: while an agent works in the tab you are looking at, a transparent native view is
+// stacked above that tab. It draws the amber corner lights and a status pill, and because the user's
+// mouse and keyboard land on it the page underneath cannot be used. The agent is unaffected: its input
+// is sent through the debugging protocol straight to the page, never through this view.
+// ---------------------------------------------------------------------------------------------
+const agentOverlays = new Map(); // tabId -> { status, step, holdUntil }
+let agentShield = null;
+let agentShieldReady = false;
+let agentShieldAttached = false;
+
+function ensureAgentShield() {
+  if (agentShield && !agentShield.webContents.isDestroyed()) return agentShield;
+  agentShield = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, 'agent_shield_preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  agentShield.setBackgroundColor('#00000000');
+  agentShield.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  agentShield.webContents.on('will-navigate', (event) => event.preventDefault());
+  agentShieldReady = false;
+  agentShieldAttached = false;
+  agentShield.webContents
+    .loadFile(path.join(__dirname, 'agent_shield.html'))
+    .then(() => { agentShieldReady = true; pushAgentShieldState(true); })
+    .catch((err) => console.warn('[SHIELD] Could not load shield page:', err.message));
+  return agentShield;
+}
+
+function pushAgentShieldState(fresh = false) {
+  if (!agentShield || !agentShieldReady || agentShield.webContents.isDestroyed()) return;
+  const state = agentOverlays.get(activeTabId);
+  if (!state) return;
+  const payload = JSON.stringify({ status: state.status, step: state.step || '' });
+  agentShield.webContents.executeJavaScript(`window.__shield(${payload}, ${fresh ? 'true' : 'false'})`, true)
+    .catch(() => { /* shield page is reloading */ });
+}
+
+function detachAgentShield() {
+  if (agentShield && agentShieldAttached && mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.contentView.removeChildView(agentShield); } catch { /* already detached */ }
+  }
+  agentShieldAttached = false;
+}
+
+// Show the shield above the active tab while its agent works (and briefly after, to show the result);
+// otherwise remove it. Call after anything that changes the active tab, its bounds or its agent state.
+function updateAgentShield() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const state = agentOverlays.get(activeTabId);
+  const view = activeTabId ? views.get(activeTabId) : null;
+  const viewShown = view && !view.webContents.isDestroyed() && mainWindow.contentView.children.includes(view);
+  const active = state && (state.status === 'working' || Date.now() < (state.holdUntil || 0));
+  if (!viewShown || !active) {
+    detachAgentShield();
+    return;
+  }
+  const shield = ensureAgentShield();
+  const wasAttached = agentShieldAttached;
+  shield.setBounds(view.getBounds());
+  mainWindow.contentView.addChildView(shield); // re-adding keeps it above the tab view
+  agentShieldAttached = true;
+  pushAgentShieldState(!wasAttached);
+  // Keyboard input must not reach the locked page either.
+  if (!wasAttached && state.status === 'working' && view.webContents.isFocused()) {
+    shield.webContents.focus();
+  }
+}
+
+
 ipcMain.on('tabs-create', (event, tabId, url) => {
   if (!isAuthorizedSender(event)) return;
   if (typeof tabId !== 'string' || !tabId) return;
@@ -528,10 +604,46 @@ ipcMain.handle('tabs-open-agent', async (event, { tabId, url, label } = {}) => {
   return getDevToolsTargetId(view.webContents);
 });
 
-ipcMain.on('tabs-set-agent-status', (event, tabId, status) => {
+const cleanStep = (step) => (typeof step === 'string' ? step.replace(/\s+/g, ' ').trim().slice(0, 120) : '');
+
+ipcMain.on('tabs-set-agent-status', (event, tabId, status, step) => {
   if (!isAuthorizedSender(event)) return;
-  if (!views.has(tabId) || !AGENT_TAB_STATUSES.has(status)) return;
-  notifyRenderer(tabId, { agentStatus: status });
+  if (!views.has(tabId)) return;
+  // "idle" clears the marker (used a few seconds after a single-agent run ends in the user's own tab)
+  if (status === 'idle') {
+    agentOverlays.delete(tabId);
+    notifyRenderer(tabId, { agentStatus: null, agentStep: '' });
+    updateAgentShield();
+    return;
+  }
+  if (!AGENT_TAB_STATUSES.has(status)) return;
+  const prev = agentOverlays.get(tabId);
+  const nextStep = status === 'working' ? (cleanStep(step) || (prev && prev.status === 'working' ? prev.step : '')) : '';
+  // A finished agent keeps the shield up for a moment so the result ("Done") is seen, then lets go.
+  const holdUntil = status === 'working' ? 0 : Date.now() + 1500;
+  agentOverlays.set(tabId, { status, step: nextStep, holdUntil });
+  notifyRenderer(tabId, { agentStatus: status, agentStep: nextStep });
+  updateAgentShield();
+  if (holdUntil) setTimeout(updateAgentShield, 1560);
+});
+
+// The Stop button on the shield: hand the request to the React shell, which owns stopping agents.
+ipcMain.on('agent-shield-stop', (event) => {
+  if (!agentShield || agentShield.webContents.isDestroyed() || event.sender !== agentShield.webContents) return;
+  notifyRenderer(activeTabId || '', { agentStopRequested: Date.now() });
+});
+
+// Live step text for a working agent; ignored unless the tab is currently marked as working, so a late
+// progress event can never flip a finished tab back to "working".
+ipcMain.on('tabs-set-agent-step', (event, tabId, step) => {
+  if (!isAuthorizedSender(event)) return;
+  const state = agentOverlays.get(tabId);
+  if (!state || state.status !== 'working') return;
+  const next = cleanStep(step);
+  if (!next || next === state.step) return;
+  state.step = next;
+  notifyRenderer(tabId, { agentStep: next });
+  if (tabId === activeTabId) pushAgentShieldState();
 });
 
 ipcMain.on('tabs-destroy', (event, tabId) => {
@@ -544,6 +656,7 @@ ipcMain.on('tabs-destroy', (event, tabId) => {
     view.webContents.close();
   }
   views.delete(tabId);
+  agentOverlays.delete(tabId);
 
   if (activeTabId === tabId) {
     activeTabId = null;

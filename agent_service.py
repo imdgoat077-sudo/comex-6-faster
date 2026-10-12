@@ -63,6 +63,11 @@ logger = logging.getLogger(__name__)
 LLM_TIMEOUT_S = 60.0
 LLM_MAX_RETRIES = 1
 
+# Research-worker limits, enforced in execute_agent_loop (not just requested in the prompt).
+WORKER_MAX_TOOL_CALLS = int(os.getenv("COMEX_WORKER_MAX_TOOL_CALLS", "10"))
+# Browsing stops this long before a worker's deadline so its final answer still fits in the time limit.
+WORKER_WRAP_UP_MARGIN_S = 15.0
+
 
 def _make_llm():
     """The single place model clients are created: bounded timeout plus one retry on transient errors."""
@@ -1610,6 +1615,8 @@ async def execute_agent_loop(
     task_context: Optional[dict] = None,
     inbox: Optional[asyncio.Queue] = None,
     allow_delegation: bool = False,
+    deadline_mono: Optional[float] = None,
+    max_tool_calls: Optional[int] = None,
 ) -> AgentLoopResult:
     timing = {
         "memory_prep_ms": 0.0,
@@ -1827,7 +1834,7 @@ async def execute_agent_loop(
                 best_adapter = matched_adapters[0]
                 adapter_name = best_adapter.get("name", "site-adapter")
                 logger.info(f"⚡ Fast-Path candidate found: '{adapter_name}' for domain {target_domain}")
-                await _emit("thinking", {"detail": f"⚡ Fast-Path match found: {adapter_name}. Verifying DOM..."})
+                await _emit("thinking", {"detail": f"Checking a saved shortcut for {target_domain}"})
 
                 from graph.adapter_runner import verify_dom_fingerprint, execute_fast_path_adapter, AdapterExecutionError
                 from graph.adapter_compiler import extract_parameters_from_task
@@ -1873,7 +1880,7 @@ async def execute_agent_loop(
 
                     except AdapterExecutionError as aee:
                         logger.warning(f"⚡ Fast-Path failed: {aee.error_detail}. Dropping into Self-Healing Slow Path...")
-                        await _emit("thinking", {"detail": f"Website layout change detected on {target_domain}. Self-healing in progress..."})
+                        await _emit("thinking", {"detail": f"{target_domain} has changed since last time, working it out again"})
                         self_healing_context = f"""
 ---
 [SELF-HEALING ADAPTER FAILURE NOTICE]
@@ -1891,7 +1898,7 @@ INSTRUCTION: Inspect the current live DOM, find the updated selector, complete t
         except Exception as fpe:
             logger.warning(f"Fast-path evaluation error: {fpe}")
 
-    await _emit("thinking", {"detail": "Analyzing user task and retrieving context..."})
+    await _emit("thinking", {"detail": "Reading your request"})
     t_mem_start = time.perf_counter()
     auto_context_text = ""
     if graph_store:
@@ -2193,6 +2200,45 @@ Schema:
     # never derived from LLM content.
     _episode = {"outcome": "error", "self_reported": ""}
     empty_final_nudged = False
+    # Enforced limits (workers/helpers): no browser tool runs once the action budget is used up or the
+    # wrap-up cutoff before the deadline has passed; the agent then gets one tool-less final turn.
+    executed_tool_calls = 0
+    deadline_hit = False
+
+    def _wrap_up_reason() -> Optional[str]:
+        if deadline_hit:
+            return "the time limit was reached"
+        if deadline_mono is not None and time.monotonic() >= deadline_mono - WORKER_WRAP_UP_MARGIN_S:
+            return "the time limit is almost reached"
+        if max_tool_calls is not None and executed_tool_calls >= max_tool_calls:
+            return f"the limit of {max_tool_calls} browser actions was reached"
+        return None
+
+    async def _final_turn_without_tools(reason: str):
+        """One last model turn with browser actions disabled; findings so far are kept in the reply."""
+        metadata["stopped_early"] = reason
+        messages.append(HumanMessage(content=(
+            f"STOP: {reason}. No more browser actions are available. Write your final answer now, in the required "
+            "structure, from the evidence you have already collected. Under Limitations, say what you could not finish."
+        )))
+        budget = WORKER_WRAP_UP_MARGIN_S if deadline_mono is None else max(5.0, deadline_mono - time.monotonic())
+        try:
+            reply = await asyncio.wait_for(llm_with_tools.ainvoke(messages), timeout=budget)
+            text = reply.content if isinstance(reply.content, str) else str(reply.content or "")
+        except Exception as exc:
+            logger.warning(f"Final no-tool turn failed after {reason}: {exc}")
+            text = ""
+        if not text.strip():
+            visited = []
+            for tr in metadata["tool_traces"]:
+                url = (tr.get("args") or {}).get("url")
+                if url and url not in visited:
+                    visited.append(url)
+            text = ("### Findings\n- No summary could be written before the cutoff.\n### Coverage\n"
+                    + ("\n".join(f"- visited {u}" for u in visited) or "- no pages visited")
+                    + f"\n### Limitations\n- Stopped because {reason}; the research is incomplete.")
+        # Any tool calls in this reply are deliberately dropped: browsing is over.
+        return AIMessage(content=text)
 
     try:
         for step in range(100): # Max 100 steps
@@ -2205,7 +2251,11 @@ Schema:
                 )))
             logger.info(f"Agent step {step}")
             t_llm0 = time.perf_counter()
-            response = await llm_with_tools.ainvoke(messages)
+            wrap_reason = _wrap_up_reason()
+            if wrap_reason:
+                response = await _final_turn_without_tools(wrap_reason)
+            else:
+                response = await llm_with_tools.ainvoke(messages)
             t_llm_dur = round((time.perf_counter() - t_llm0) * 1000.0, 2)
             timing["llm_roundtrips_ms"].append(t_llm_dur)
             timing["total_llm_ms"] = round(timing["total_llm_ms"] + t_llm_dur, 2)
@@ -2265,6 +2315,15 @@ Schema:
             tool_map = {t.name: t for t in tools}
 
             for tool_call in response.tool_calls:
+                gate_reason = _wrap_up_reason()
+                if gate_reason:
+                    # Enforced in code: the call is answered but never executed.
+                    messages.append(ToolMessage(
+                        content=f"Not executed: {gate_reason}. Write your final answer from the evidence collected.",
+                        tool_call_id=tool_call["id"],
+                    ))
+                    continue
+                executed_tool_calls += 1
                 metadata["tool_call_count"] += 1
                 is_error = False
 
@@ -2311,6 +2370,8 @@ Schema:
                 timing["total_tool_ms"] = round(timing["total_tool_ms"] + t_tool_dur, 2)
 
                 is_error, err_desc = classify_tool_result(result)
+                if "[DEADLINE_EXCEEDED]" in str(result):
+                    deadline_hit = True
                 messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
 
                 if is_error:
@@ -2617,7 +2678,7 @@ async def run_agent_stream(request: AgentRequest, raw_req: Request = None):
             await queue.put(("perception", {
                 "url": request.url or "",
                 "tabId": request.tabId or "",
-                "detail": f"Connected to tab: {request.url or 'Current page'}"
+                "detail": f"Working in {request.url or 'the current tab'}"
             }))
 
             loop_kwargs = {
@@ -2795,6 +2856,8 @@ def make_worker_task_fn(brief: str, inbox: Optional[asyncio.Queue] = None):
                 worker_token=context.lease.lease_token if context.lease else None,
                 tool_service=tool_service,
                 inbox=inbox,
+                deadline_mono=context.deadline_mono,
+                max_tool_calls=WORKER_MAX_TOOL_CALLS,
             )
         except Exception as exc:
             return WorkerResult(
@@ -2814,6 +2877,7 @@ def make_worker_task_fn(brief: str, inbox: Optional[asyncio.Queue] = None):
             if tc_url and tc_url not in sources:
                 sources.append(tc_url)
 
+        llm_ms = (meta.get("timing") or {}).get("llm_roundtrips_ms") or []
         return WorkerResult(
             findings=str(loop_res),
             source_urls=sources,
@@ -2821,6 +2885,9 @@ def make_worker_task_fn(brief: str, inbox: Optional[asyncio.Queue] = None):
             error=loop_error,
             tool_calls_count=meta.get("tool_call_count", 0),
             execution_time_ms=round((time.monotonic() - t0) * 1000.0, 2),
+            llm_calls=len(llm_ms),
+            avg_llm_ms=round(sum(llm_ms) / len(llm_ms), 1) if llm_ms else None,
+            stopped_early=meta.get("stopped_early"),
         )
 
     return _task_fn
@@ -3012,8 +3079,11 @@ async def _create_orchestration_run(req: "OrchestrateRequest"):
         ]
         return orch.create_run(req.user_request, tasks)
 
+    t_plan = time.monotonic()
     plan = await decompose_request_via_llm(req.user_request, orch.llm, max_tasks=orch.max_concurrency)
-    return orch.create_run(req.user_request, plan.tasks, follow_up_action=plan.follow_up_action)
+    run = orch.create_run(req.user_request, plan.tasks, follow_up_action=plan.follow_up_action)
+    run.planning_ms = round((time.monotonic() - t_plan) * 1000.0, 2)
+    return run
 
 
 # run_id -> future resolved by POST /agent/orchestrate/approve
@@ -3065,6 +3135,7 @@ def _orchestration_payload(run, res) -> dict:
         "missing_information": res.missing_information,
         "follow_up": res.follow_up,
         "duration_ms": res.execution_duration_ms,
+        "timing": res.timing,
     }
 
 

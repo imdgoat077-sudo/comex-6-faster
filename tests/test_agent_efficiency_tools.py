@@ -364,3 +364,104 @@ async def test_delegation_tools_only_for_top_level_agents():
         plain = {t.name for t in llm.bind_tools.call_args.args[0]}
     assert {"start_agent", "wait_for_agents", "message_agent", "list_agents", "stop_agent"} <= top_level
     assert not plain & {"start_agent", "wait_for_agents"}
+
+
+# --- Enforced worker limits (action budget and deadline) -----------------------------------
+
+async def _run_limited_loop(llm_replies, *, tool_result="page text", **limits):
+    """Run the agent loop with one counting tool and scripted model replies; return (result, tool_runs, llm)."""
+    from langchain_core.messages import AIMessage
+    runs = []
+
+    @_as.tool
+    async def browser_extract(selector: str = "") -> str:
+        """Read the page."""
+        runs.append(selector)
+        return tool_result
+
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=[
+        r if isinstance(r, AIMessage) else
+        AIMessage(content="", tool_calls=[{"name": "browser_extract", "args": {"selector": s}, "id": f"c{i}_{s}"} for s in r])
+        if isinstance(r, list) else AIMessage(content=r, tool_calls=[])
+        for i, r in enumerate(llm_replies)
+    ])
+    llm.bind_tools = MagicMock(return_value=llm)
+    with patch.object(_as, "ChatOpenAI", return_value=llm), \
+         patch.object(_as, "_make_agent_loop_context", return_value=MagicMock()), \
+         patch.object(_as, "_build_browser_tools", side_effect=lambda **kw: [browser_extract]):
+        res = await _as.execute_agent_loop(task="research", default_cdp_url="http://x", use_graph=False, **limits)
+    return res, runs, llm
+
+
+def _final_turn_prompt(llm) -> str:
+    return " ".join(str(m.content) for m in llm.ainvoke.await_args.args[0] if "STOP:" in str(m.content))
+
+
+async def test_action_budget_stops_browsing_and_keeps_findings():
+    # The model keeps asking for more tools; only 2 may run, then one tool-less final turn
+    res, runs, llm = await _run_limited_loop(
+        [["a"], ["b"], "### Findings\n- [Paper](https://arxiv.org/abs/2401.00001)"], max_tool_calls=2)
+    assert runs == ["a", "b"]
+    assert llm.ainvoke.await_count == 3
+    assert "limit of 2 browser actions" in _final_turn_prompt(llm)
+    assert str(res).startswith("### Findings")
+    assert res.metadata["stopped_early"] == "the limit of 2 browser actions was reached"
+
+
+async def test_calls_beyond_the_budget_in_one_reply_are_never_executed():
+    res, runs, llm = await _run_limited_loop([["a", "b", "c"], "done"], max_tool_calls=2)
+    assert runs == ["a", "b"]
+    refused = [m for m in llm.ainvoke.await_args.args[0] if getattr(m, "tool_call_id", "") == "c0_c"]
+    assert refused and refused[0].content.startswith("Not executed")
+    assert str(res) == "done"
+
+
+async def test_deadline_cutoff_allows_no_tools_only_a_final_answer():
+    import time as _time
+    # Inside the wrap-up margin from the start: the model asks for a tool, but none may run
+    res, runs, llm = await _run_limited_loop(
+        [AIMessage_with_tool_and_text()], deadline_mono=_time.monotonic() + 5)
+    assert runs == []
+    assert llm.ainvoke.await_count == 1
+    assert "time limit" in res.metadata["stopped_early"]
+    assert "partial findings" in str(res)  # text kept, tool call dropped
+
+
+async def test_deadline_exceeded_tool_result_triggers_wrap_up():
+    res, runs, llm = await _run_limited_loop(
+        [["a"], "### Findings\n- partial"], tool_result="[DEADLINE_EXCEEDED] Execution deadline exceeded")
+    assert runs == ["a"]
+    assert res.metadata["stopped_early"] == "the time limit was reached"
+    assert "STOP: the time limit was reached" in _final_turn_prompt(llm)
+
+
+async def test_final_turn_failure_still_reports_what_was_covered():
+    from langchain_core.messages import AIMessage
+    res, runs, llm = await _run_limited_loop(
+        [AIMessage(content="", tool_calls=[{"name": "browser_extract", "args": {"selector": "a"}, "id": "c1"}]),
+         AIMessage(content="", tool_calls=[])], max_tool_calls=1)
+    assert runs == ["a"]
+    assert "### Limitations" in str(res) and "incomplete" in str(res)
+
+
+def AIMessage_with_tool_and_text():
+    from langchain_core.messages import AIMessage
+    return AIMessage(content="### Findings\n- partial findings",
+                     tool_calls=[{"name": "browser_extract", "args": {"selector": "x"}, "id": "t1"}])
+
+
+async def test_workers_get_the_enforced_limits():
+    seen = {}
+
+    async def fake_loop(**kwargs):
+        seen.update(kwargs)
+        return _as.AgentLoopResult("ok", {"tool_traces": [], "timing": {"llm_roundtrips_ms": [800.0, 1200.0]},
+                                          "tool_call_count": 3, "stopped_early": "the limit of 10 browser actions was reached"})
+
+    ctx = MagicMock(worker_id="w", target_tab_id="t", lease=None, metadata={}, deadline_mono=123.0)
+    with patch.object(_as, "execute_agent_loop", side_effect=fake_loop):
+        result = await _as.make_worker_task_fn("brief")(ctx, MagicMock())
+    assert seen["deadline_mono"] == 123.0 and seen["max_tool_calls"] == _as.WORKER_MAX_TOOL_CALLS
+    assert result.llm_calls == 2 and result.avg_llm_ms == 1000.0 and result.tool_calls_count == 3
+    assert result.stopped_early.startswith("the limit of 10")

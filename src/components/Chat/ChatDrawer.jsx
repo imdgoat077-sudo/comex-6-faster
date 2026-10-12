@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   X, ArrowUp, Square, Copy, Check, ChevronRight, ChevronDown, Brain, ArrowLeft,
-  SquarePen, RefreshCw, Trash2, Plus, Loader2, Circle, Minus, ExternalLink, Users, User
+  SquarePen, RefreshCw, Trash2, Plus, Loader2, Circle, Minus, ExternalLink, Users, User, CornerDownLeft
 } from 'lucide-react';
-import MarkdownRenderer from './MarkdownRenderer';
+import MarkdownRenderer, { hasMarkdownTable } from './MarkdownRenderer';
 import { runSwarm, stopSwarmRun, respondToSwarmApproval } from '../../agents/orchestratorClient';
 import './ChatDrawer.css';
 
@@ -31,6 +31,17 @@ function useNow(active) {
   return now;
 }
 
+export const DRAWER_WIDTH = 440;
+const DRAWER_MIN = 360;
+// Wide enough for a 4-5 column comparison table, while leaving the page usable.
+const wideDrawerWidth = () => Math.min(760, Math.round(window.innerWidth * 0.55));
+const maxDrawerWidth = () => Math.max(DRAWER_MIN, Math.min(1000, window.innerWidth - 420));
+
+// Tab markers: the page overlay and the tab-strip card follow these. No-ops outside Electron.
+const tabsBridge = () => (typeof window !== 'undefined' ? window.nexusNative?.tabs : undefined);
+const markAgentStep = (tabId, step) => { if (tabId && step) tabsBridge()?.setAgentStep?.(tabId, step); };
+const markAgentTab = (tabId, status, step) => { if (tabId) tabsBridge()?.setAgentStatus?.(tabId, status, step); };
+
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'blocked']);
 
 function StatusIcon({ status }) {
@@ -38,19 +49,43 @@ function StatusIcon({ status }) {
   if (status === 'completed') return <Check size={14} className="status-icon status-ok" aria-label="Done" />;
   if (status === 'failed' || status === 'blocked') return <X size={14} className="status-icon status-err" aria-label="Failed" />;
   if (status === 'cancelled') return <Minus size={14} className="status-icon status-muted" aria-label="Stopped" />;
-  return <Circle size={12} className="status-icon status-muted" aria-label="Queued" />;
+  return <Circle size={14} strokeWidth={1.75} className="status-icon status-muted" aria-label="Queued" />;
 }
 
 const RUN_PHASE_LABEL = {
-  planning: 'Planning the work',
+  planning: 'Splitting the task between agents',
   working: 'Agents are working',
-  comparing: 'Comparing results',
+  comparing: 'Combining the results',
   approval: 'Waiting for your approval',
   acting: 'Carrying out the approved step',
   done: 'Done',
-  failed: 'Run failed',
+  failed: "The run didn't finish",
   stopped: 'Stopped',
 };
+
+// What an agent row says when the agent has not reported a step of its own yet.
+function agentStepText(agent) {
+  if (agent.status === 'queued') return 'Waiting for a free slot';
+  if (agent.status === 'running') return agent.currentStep || 'Opening its tab';
+  return null;
+}
+
+// Placeholder rows shaped like the agent list, shown while the plan is being made.
+function SkeletonRows({ count = 2 }) {
+  return (
+    <ol className="run-agents" aria-hidden="true">
+      {Array.from({ length: count }, (_, i) => (
+        <li key={i} className="run-agent skeleton-row">
+          <span className="skeleton skeleton-dot" />
+          <span className="skeleton-lines">
+            <span className="skeleton skeleton-line" style={{ width: `${78 - i * 14}%` }} />
+            <span className="skeleton skeleton-line skeleton-line-sm" style={{ width: `${46 - i * 8}%` }} />
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
 
 function RunPanel({ run, onOpenTab }) {
   const isLive = !['done', 'failed', 'stopped'].includes(run.phase);
@@ -82,6 +117,8 @@ function RunPanel({ run, onOpenTab }) {
         {expanded ? <ChevronDown size={14} className="run-chevron" /> : <ChevronRight size={14} className="run-chevron" />}
       </button>
 
+      {expanded && run.phase === 'planning' && run.agents.length === 0 && <SkeletonRows />}
+
       {expanded && run.agents.length > 0 && (
         <ol className="run-agents">
           {run.agents.map((agent) => {
@@ -92,8 +129,8 @@ function RunPanel({ run, onOpenTab }) {
                 <StatusIcon status={agent.status} />
                 <div className="run-agent-body">
                   <span className="run-agent-task">{agent.description}</span>
-                  {agent.status === 'running' && agent.currentStep && (
-                    <span className="run-agent-step">{agent.currentStep}</span>
+                  {agentStepText(agent) && (
+                    <span className="run-agent-step" key={agentStepText(agent)}>{agentStepText(agent)}</span>
                   )}
                   {agent.error && <span className="run-agent-error">{agent.error}</span>}
                 </div>
@@ -115,7 +152,10 @@ function RunPanel({ run, onOpenTab }) {
           {run.phase === 'comparing' && (
             <li className="run-agent agent-running">
               <StatusIcon status="running" />
-              <div className="run-agent-body"><span className="run-agent-task">Comparing what the agents found</span></div>
+              <div className="run-agent-body">
+                <span className="run-agent-task">Comparing findings</span>
+                <span className="run-agent-step">Removing duplicates and writing one answer</span>
+              </div>
             </li>
           )}
         </ol>
@@ -161,7 +201,10 @@ function EmptyState({ isMultiAgentMode, onPick }) {
       <ul className="chat-suggestions">
         {items.map((text) => (
           <li key={text}>
-            <button type="button" className="chat-suggestion" onClick={() => onPick(text)}>{text}</button>
+            <button type="button" className="chat-suggestion" onClick={() => onPick(text)}>
+              <span>{text}</span>
+              <CornerDownLeft size={13} className="chat-suggestion-go" aria-hidden="true" />
+            </button>
           </li>
         ))}
       </ul>
@@ -173,7 +216,9 @@ export default function ChatDrawer({
   isOpen,
   onClose,
   activeTab,
-  onSelectTab
+  onSelectTab,
+  width = DRAWER_WIDTH,
+  onWidthChange,
 }) {
   const [isMultiAgentMode, setIsMultiAgentMode] = useState(false);
   const [conversationId, setConversationId] = useState(() => 'conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
@@ -195,6 +240,10 @@ export default function ChatDrawer({
   const [newCategory, setNewCategory] = useState('preference');
   const [isRefreshingBrain, setIsRefreshingBrain] = useState(false);
   const activeTaskRef = useRef(null);
+  const userSizedRef = useRef(false);
+  const latestTabRef = useRef(activeTab);
+  latestTabRef.current = activeTab;
+  const singleTabRef = useRef(null); // tab the single agent is driving, marked as "working" while it runs
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -291,59 +340,86 @@ export default function ChatDrawer({
     }
   };
 
+  // The Stop button on the page shield asks for the running agent(s) to stop, same as the drawer's Stop.
+  const stopRequestRef = useRef(() => {});
+  stopRequestRef.current = () => { if (activeTaskRef.current) (isMultiAgentMode ? stopSwarm : stopSingleAgent)(); };
+  useEffect(() => {
+    const onStop = () => stopRequestRef.current();
+    window.addEventListener('comex-agent-stop', onStop);
+    return () => window.removeEventListener('comex-agent-stop', onStop);
+  }, []);
+
+  // While the single agent runs, mirror its current step onto the tab it is driving.
+  const liveStepLabel = messages.find((m) => m.id === activeSingleAgentMessageId)?.statusLabel;
+  useEffect(() => {
+    if (activeSingleAgentMessageId && singleTabRef.current) markAgentStep(singleTabRef.current, liveStepLabel);
+  }, [liveStepLabel, activeSingleAgentMessageId]);
+
+  // Widen the drawer while the conversation holds a table; back to normal for a new chat.
+  // A width the user dragged to always wins.
+  const conversationHasTable = messages.some((m) => m.sender === 'assistant' && hasMarkdownTable(m.text || m.content));
+  useEffect(() => {
+    if (userSizedRef.current || !onWidthChange) return;
+    onWidthChange(conversationHasTable ? Math.max(DRAWER_WIDTH, wideDrawerWidth()) : DRAWER_WIDTH);
+  }, [conversationHasTable]);
+
+  const startResize = (event) => {
+    if (event.button !== 0 || !onWidthChange) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    document.body.classList.add('drawer-resizing');
+    const onMove = (e) => {
+      userSizedRef.current = true;
+      onWidthChange(Math.round(Math.min(maxDrawerWidth(), Math.max(DRAWER_MIN, window.innerWidth - e.clientX))));
+    };
+    const onUp = () => {
+      document.body.classList.remove('drawer-resizing');
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+  };
+
+  const resetWidth = () => {
+    userSizedRef.current = false;
+    onWidthChange?.(conversationHasTable ? Math.max(DRAWER_WIDTH, wideDrawerWidth()) : DRAWER_WIDTH);
+  };
+
+  const nudgeWidth = (event) => {
+    if (!onWidthChange || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
+    event.preventDefault();
+    userSizedRef.current = true;
+    const step = event.key === 'ArrowLeft' ? 24 : -24;
+    onWidthChange(Math.min(maxDrawerWidth(), Math.max(DRAWER_MIN, width + step)));
+  };
+
   // Auto scroll to bottom of chat
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages, isTyping, activeSingleAgentMessageId]);
 
-  // Track active Single Agent message and append real tab activity details
+  // Keep the working panel's "where" line in sync with the tab the agent is driving.
   useEffect(() => {
-    if (!activeSingleAgentMessageId) return;
-    if (!activeTab) return;
-
-    setMessages((prev) => prev.map((msg) => {
-      if (msg.id !== activeSingleAgentMessageId) return msg;
-
-      const newActivity = [...(msg.activity || [])];
-      let stepMessage = '';
-
-      if (activeTab.isLoading) {
-        stepMessage = `Loading ${activeTab.url || 'page'}`;
-      } else if (activeTab.title && activeTab.title !== 'Comex Launchpad' && activeTab.title !== 'about:blank') {
-        stepMessage = `Opened page: ${activeTab.title}`;
-      } else if (activeTab.url && activeTab.url !== 'comex://launchpad' && activeTab.url !== 'about:blank') {
-        try {
-          const urlObj = new URL(activeTab.url);
-          stepMessage = `Navigating to ${urlObj.hostname}`;
-        } catch {
-          stepMessage = `Navigating to ${activeTab.url}`;
-        }
-      }
-
-      if (stepMessage && !newActivity.some(log => log.message === stepMessage)) {
-        newActivity.push({
-          id: `log_${Date.now()}_${Math.random()}`,
-          message: stepMessage,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-        });
-      }
-
-      const latestMsg = newActivity[newActivity.length - 1]?.message || 'Starting';
-
-      return {
-        ...msg,
-        activity: newActivity,
-        statusLabel: latestMsg
-      };
-    }));
+    if (!activeSingleAgentMessageId || !activeTab) return;
+    const url = activeTab.url || '';
+    if (!/^https?:/i.test(url)) return;
+    let host = url;
+    try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { /* keep raw url */ }
+    const where = activeTab.isLoading ? `Loading ${host}` : (activeTab.title || host);
+    setMessages((prev) => prev.map((msg) => (msg.id === activeSingleAgentMessageId ? { ...msg, where } : msg)));
   }, [activeTab?.url, activeTab?.title, activeTab?.isLoading, activeSingleAgentMessageId]);
 
   // Receive prompts submitted from the Comet-style landing page.
   useEffect(() => {
     const handleLandingPrompt = (event) => {
       const prompt = event.detail?.prompt?.trim();
-      const intent = event.detail?.intent;
-      if (prompt) handleSend(prompt, intent);
+      const { intent, mode } = event.detail || {};
+      if (mode) setIsMultiAgentMode(mode === 'multi');
+      if (prompt) handleSend(prompt, intent, mode);
     };
 
     window.addEventListener('comex-landing-prompt', handleLandingPrompt);
@@ -380,7 +456,7 @@ export default function ChatDrawer({
                 const isConv = Boolean(!isFailed && (data.is_conversational || data.type === 'chat'));
                 const errorText = data.error || data.metadata?.error;
                 const rawContent = data.content || data.text || data.result;
-                const fallbackSuccessText = isConv ? 'Hello! How can I assist you today?' : 'Task completed.';
+                const fallbackSuccessText = isConv ? 'Hi. What would you like to do?' : 'Done.';
                 const finalContent = isFailed
                   ? (errorText || rawContent || outcome.content || outcome.text || 'The agent could not complete the task.')
                   : (rawContent || outcome.content || outcome.text || fallbackSuccessText);
@@ -403,20 +479,13 @@ export default function ChatDrawer({
                 const curActivity = [...(msg.activity || [])];
 
                 if (currentEventType === 'perception') {
-                  return {
-                    ...msg,
-                    perception: {
-                      url: data.url,
-                      title: activeTab?.title || data.url,
-                      detail: data.detail || `Observing ${data.url}`
-                    }
-                  };
+                  return { ...msg, where: msg.where || (/^https?:/i.test(activeTab?.url || '') ? activeTab.title : null) };
                 }
 
                 if (currentEventType === 'thinking') {
                   return {
                     ...msg,
-                    statusLabel: data.detail || 'Thinking',
+                    statusLabel: data.detail || 'Reading your request',
                     thinking: data.detail
                   };
                 }
@@ -424,7 +493,7 @@ export default function ChatDrawer({
                 if (currentEventType === 'planning') {
                   return {
                     ...msg,
-                    statusLabel: data.detail || 'Planning the next step'
+                    statusLabel: data.detail || 'Working out the next step'
                   };
                 }
 
@@ -435,7 +504,7 @@ export default function ChatDrawer({
                     taskId: data.agent_id, description: data.description, status: 'running', startedAt: Date.now(),
                   };
                   let next = { ...base, tabId: data.tab_id || base.tabId };
-                  if (currentEventType === 'helper_progress') next.currentStep = data.label;
+                  if (currentEventType === 'helper_progress') { next.currentStep = data.label; markAgentStep(data.tab_id || base.tabId, data.label); }
                   if (currentEventType === 'helper_finished') {
                     next = { ...next, status: data.status, endedAt: Date.now(), currentStep: null,
                       error: data.status === 'completed' ? null : data.error };
@@ -473,9 +542,11 @@ export default function ChatDrawer({
                       status: data.success ? 'done' : 'failed'
                     };
                   }
+                  // The step is over; until the next one starts the model is choosing what to do.
                   return {
                     ...msg,
-                    activity: curActivity
+                    activity: curActivity,
+                    statusLabel: 'Working out the next step'
                   };
                 }
 
@@ -483,10 +554,10 @@ export default function ChatDrawer({
                   const finalContent = outcome.content || outcome.text;
                   const isConv = outcome.is_conversational;
                   const statusLbl = outcome.status === 'failed'
-                    ? 'Task failed'
+                    ? "Couldn't finish"
                     : (outcome.status === 'stopped'
-                      ? 'Task stopped'
-                      : (outcome.fast_path ? `Fast path: ${outcome.adapter_name || 'adapter'}` : (isConv ? '' : 'Task completed')));
+                      ? 'Stopped'
+                      : (outcome.fast_path ? 'Used a saved shortcut' : (isConv ? '' : 'Done')));
                   return {
                     ...msg,
                     text: finalContent,
@@ -581,7 +652,7 @@ export default function ChatDrawer({
     active.stopping = true;
     setMessages((prev) => prev.map((message) => message.id === active.messageId ? {
       ...message,
-      statusLabel: 'Stopping',
+      statusLabel: 'Stopping the agent',
     } : message));
 
     active.controller.abort();
@@ -640,6 +711,7 @@ export default function ChatDrawer({
     const updateMessage = (fn) => setMessages((prev) => prev.map((m) => (m.id === messageId ? fn(m) : m)));
     const updateRun = (fn) => updateMessage((m) => ({ ...m, run: fn(m.run) }));
 
+    const tabByTask = {};
     const handleTaskUpdate = (ev) => {
       switch (ev.eventType) {
         case 'run_started':
@@ -651,6 +723,7 @@ export default function ChatDrawer({
           }));
           return;
         case 'task_started':
+          if (ev.tab_id) tabByTask[ev.task_id] = ev.tab_id;
           updateRun((run) => {
             const started = { taskId: ev.task_id, description: ev.description, status: 'running', tabId: ev.tab_id, startedAt: Date.now() };
             const exists = run.agents.some((a) => a.taskId === ev.task_id);
@@ -662,6 +735,7 @@ export default function ChatDrawer({
           });
           return;
         case 'task_progress':
+          markAgentStep(tabByTask[ev.task_id], ev.label);
           updateRun((run) => ({
             ...run,
             agents: run.agents.map((a) => (a.taskId === ev.task_id ? { ...a, currentStep: ev.label } : a)),
@@ -708,7 +782,7 @@ export default function ChatDrawer({
         ...m,
         text: stopped
           ? 'Stopped. The agents’ tabs stay open if you want to look at what they found.'
-          : `The run failed: ${err.message}`,
+          : `The run stopped with an error: ${err.message}`,
         failed: !stopped,
         approval: expireApproval(m),
         run: {
@@ -731,12 +805,23 @@ export default function ChatDrawer({
       sender: 'assistant',
       text: '',
       status: 'working',
-      statusLabel: 'Starting',
+      statusLabel: 'Reading your request',
       activity: [],
       startedAt: Date.now(),
       timestamp: nowTime()
     }]);
     setActiveSingleAgentMessageId(messageId);
+
+    // Mark the tab the agent will drive (the active one) so it is visible in the tab strip and the page.
+    singleTabRef.current = latestTabRef.current?.id || null;
+    markAgentTab(singleTabRef.current, 'working', 'Reading your request');
+    const endSingleTab = (status) => {
+      const tabId = singleTabRef.current;
+      singleTabRef.current = null;
+      markAgentTab(tabId, status);
+      // Your own tab goes back to normal a few seconds after the result is shown.
+      if (tabId) setTimeout(() => markAgentTab(tabId, 'idle'), 3200);
+    };
 
     try {
       const taskId = `task-${Date.now()}`;
@@ -770,17 +855,18 @@ export default function ChatDrawer({
       const isConv = Boolean(outcome.is_conversational);
       const defaultFallback = terminalStatus === 'failed'
         ? 'The agent could not complete the task.'
-        : (isConv ? 'Hello! How can I help?' : 'Task completed.');
+        : (isConv ? 'Hi. What would you like to do?' : 'Done.');
       const cleanText = terminalStatus === 'stopped'
         ? 'Stopped.'
         : (outcome.content || outcome.text || defaultFallback).replace(/^### (Agent Error|Connection Error|Browser-Use Result)\s*/, '');
+      endSingleTab(terminalStatus === 'completed' ? 'completed' : terminalStatus === 'stopped' ? 'cancelled' : 'failed');
       const isFastPath = Boolean(outcome.fast_path);
       setMessages((prev) => prev.map((message) => message.id === messageId ? {
         ...message,
         text: cleanText,
         content: cleanText,
         status: terminalStatus,
-        statusLabel: terminalStatus === 'stopped' ? 'Stopped' : terminalStatus === 'failed' ? 'Failed' : (isConv ? '' : 'Completed'),
+        statusLabel: terminalStatus === 'stopped' ? 'Stopped' : terminalStatus === 'failed' ? "Couldn't finish" : (isConv ? '' : 'Done'),
         activity: message.activity || [],
         durationMs: outcome.durationMs ?? (Date.now() - message.startedAt),
         is_conversational: isConv,
@@ -793,11 +879,12 @@ export default function ChatDrawer({
     } catch (err) {
       const active = activeTaskRef.current;
       const stopped = active?.stopping || err.name === 'AbortError';
+      endSingleTab(stopped ? 'cancelled' : 'failed');
       setMessages((prev) => prev.map((message) => message.id === messageId ? {
         ...message,
         text: stopped ? 'Stopped.' : err.message || 'The agent could not complete the task.',
         status: stopped ? 'stopped' : 'failed',
-        statusLabel: stopped ? 'Stopped' : 'Failed',
+        statusLabel: stopped ? 'Stopped' : "Couldn't finish",
         activity: message.activity || [],
         completed: true,
       } : message));
@@ -808,7 +895,7 @@ export default function ChatDrawer({
     }
   };
 
-  const handleSend = async (textToSend = input, intent = undefined) => {
+  const handleSend = async (textToSend = input, intent = undefined, mode = undefined) => {
     const text = textToSend.trim();
     if (!text || isTyping) return;
 
@@ -816,7 +903,7 @@ export default function ChatDrawer({
     if (textToSend === input) setInput('');
     setIsTyping(true);
 
-    if (isMultiAgentMode) {
+    if (mode ? mode === 'multi' : isMultiAgentMode) {
       await runMultiAgent(text);
     } else {
       await runSingleAgent(text, intent);
@@ -841,12 +928,15 @@ export default function ChatDrawer({
     setConversationId('conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
     setMessages([]);
     setExpandedActivity({});
+    userSizedRef.current = false;
     inputRef.current?.focus();
   };
 
   if (!isOpen) return null;
 
   const tabTitle = activeTab?.url && !activeTab.url.startsWith('comex://') ? activeTab.title : null;
+
+  const latestAssistantId = [...messages].reverse().find((m) => m.sender === 'assistant')?.id;
 
   const renderFooter = (msg) => (
     <div className="msg-footer">
@@ -866,16 +956,15 @@ export default function ChatDrawer({
   );
 
   const renderSingleAgentWorking = (msg) => (
-    <div className="agent-working-panel" aria-live="polite">
-      <div className="agent-working-status">
+    <div className="agent-working-panel">
+      <div className="run-progress" aria-hidden="true" />
+      <div className="agent-working-status" role="status" aria-live="polite">
         <Loader2 size={14} className="status-icon status-running animate-spin" />
-        <span className="agent-working-label">{msg.statusLabel || 'Starting'}</span>
+        <span className="agent-working-label" key={msg.statusLabel}>{msg.statusLabel || 'Reading your request'}</span>
         <ElapsedTime since={msg.startedAt} />
       </div>
-      {msg.perception && (
-        <div className="agent-working-context" title={msg.perception.url}>
-          Reading {msg.perception.title || msg.perception.url}
-        </div>
+      {msg.where && (
+        <div className="agent-working-context" title={msg.where}>{msg.where}</div>
       )}
       {msg.activity?.length > 0 && (
         <ol className="agent-steps">
@@ -903,7 +992,7 @@ export default function ChatDrawer({
           aria-expanded={open}
         >
           <StatusIcon status={msg.status === 'completed' ? 'completed' : msg.status === 'stopped' ? 'cancelled' : 'failed'} />
-          <span>{msg.statusLabel || 'Completed'} in {steps.length} {steps.length === 1 ? 'step' : 'steps'}</span>
+          <span>{msg.statusLabel || 'Done'} in {steps.length} {steps.length === 1 ? 'step' : 'steps'}</span>
           {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
         {open && (
@@ -963,7 +1052,7 @@ export default function ChatDrawer({
         {isWorking ? renderSingleAgentWorking(msg) : renderStepsToggle(msg)}
         {(msg.text || msg.content) && (
           <div className="msg-body">
-            <MarkdownRenderer content={msg.text || msg.content} />
+            <MarkdownRenderer content={msg.text || msg.content} animate={msg.id === latestAssistantId} />
           </div>
         )}
         {renderApproval(msg)}
@@ -974,6 +1063,19 @@ export default function ChatDrawer({
 
   return (
     <aside className="chat-drawer animate-slide-right" aria-label="Comex assistant">
+      <div
+        className="drawer-resize-handle"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize assistant"
+        aria-valuenow={width}
+        aria-valuemin={DRAWER_MIN}
+        tabIndex={0}
+        title="Drag to resize, double-click to reset"
+        onPointerDown={startResize}
+        onDoubleClick={resetWidth}
+        onKeyDown={nudgeWidth}
+      />
       <header className="drawer-header">
         {activeDrawerTab === 'brain' ? (
           <>
@@ -1011,7 +1113,8 @@ export default function ChatDrawer({
       {activeDrawerTab === 'chat' ? (
         <>
           <div className="drawer-modebar">
-            <div className="mode-switch" role="radiogroup" aria-label="Agent mode">
+            <div className="mode-switch" role="radiogroup" aria-label="Agent mode" style={{ '--idx': isMultiAgentMode ? 1 : 0 }}>
+              <span className="mode-thumb" aria-hidden="true" />
               <button
                 type="button"
                 role="radio"
